@@ -35,7 +35,6 @@ export const MainContent = () => (
     </Dropzone>
     <MainActions />
     <BucketPolicyModal />
-    <MakeBucketModal />
     <UploadModal />
   </div>
 )

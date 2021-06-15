@@ -23,6 +23,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -348,11 +349,16 @@ func (l *s3Objects) ListBuckets(ctx context.Context) ([]minio.BucketInfo, error)
 		return nil, minio.ErrorRespToObjectError(err)
 	}
 
-	b := make([]minio.BucketInfo, len(buckets))
-	for i, bi := range buckets {
-		b[i] = minio.BucketInfo{
-			Name:    bi.Name,
-			Created: bi.CreationDate,
+	b := []minio.BucketInfo{}
+	// var offset = 0
+	var filterString = os.Getenv("BUCKET_NAME_FILTER")
+
+	for _, bi := range buckets {
+		if filterString == "" || strings.Contains(bi.Name, filterString) {
+			b = append(b, minio.BucketInfo{
+				Name:    bi.Name,
+				Created: bi.CreationDate,
+			})
 		}
 	}
 

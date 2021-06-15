@@ -57,6 +57,30 @@ docker_secrets_env() {
     fi
 }
 
+docker_aws_secrets_env() {
+    if [ -f "$AWS_ACCESS_KEY_ID_FILE" ]; then
+        AWS_ACCESS_FILE="$AWS_ACCESS_KEY_ID_FILE"
+    else
+        AWS_ACCESS_FILE="/run/secrets/$AWS_ACCESS_KEY_ID_FILE"
+    fi
+    if [ -f "$AWS_SECRET_ACCESS_KEY_FILE" ]; then
+        AWS_SECRET_FILE="$AWS_SECRET_ACCESS_KEY_FILE"
+    else
+        AWS_SECRET_FILE="/run/secrets/$AWS_SECRET_ACCESS_KEY_FILE"
+    fi
+
+    if [ -f "$AWS_ACCESS_FILE" ] && [ -f "$AWS_SECRET_FILE" ]; then
+        if [ -f "$AWS_ACCESS_FILE" ]; then
+            AWS_ACCESS_KEY="$(cat "$AWS_ACCESS_FILE")"
+            export AWS_ACCESS_KEY
+        fi
+        if [ -f "$AWS_SECRET_FILE" ]; then
+            AWS_SECRET_KEY="$(cat "$AWS_SECRET_FILE")"
+            export AWS_SECRET_KEY
+        fi
+    fi
+}
+
 ## Set KMS_SECRET_KEY from docker secrets if provided
 docker_kms_secret_encryption_env() {
     if [ -f "$MINIO_KMS_SECRET_KEY_FILE" ]; then
@@ -92,6 +116,8 @@ docker_secrets_env_old
 
 ## Set access env from secrets if necessary. Override
 docker_secrets_env
+
+docker_aws_secrets_env
 
 ## Set kms encryption from secrets if necessary. Override
 docker_kms_secret_encryption_env

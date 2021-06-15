@@ -18,19 +18,14 @@ import React from "react"
 import { connect } from "react-redux"
 import { Dropdown, OverlayTrigger, Tooltip } from "react-bootstrap"
 import web from "../web"
-import * as actionsBuckets from "../buckets/actions"
 import * as uploadsActions from "../uploads/actions"
 import { getPrefixWritable } from "../objects/selectors"
 
 export const MainActions = ({
   prefixWritable,
   uploadFile,
-  showMakeBucketModal
 }) => {
   const uploadTooltip = <Tooltip id="tt-upload-file">Upload file</Tooltip>
-  const makeBucketTooltip = (
-    <Tooltip id="tt-create-bucket">Create bucket</Tooltip>
-  )
   const onFileUpload = e => {
     e.preventDefault()
     let files = e.target.files
@@ -67,21 +62,6 @@ export const MainActions = ({
               </label>
             </a>
           </OverlayTrigger>
-          {loggedIn && (
-            <OverlayTrigger placement="left" overlay={makeBucketTooltip}>
-              <a
-                href="#"
-                id="show-make-bucket"
-                className="feba-btn feba-bucket"
-                onClick={e => {
-                  e.preventDefault()
-                  showMakeBucketModal()
-                }}
-              >
-                <i className="far fa-hdd" />
-              </a>
-            </OverlayTrigger>
-          )}
         </Dropdown.Menu>
       </Dropdown>
     )
@@ -99,7 +79,6 @@ const mapStateToProps = state => {
 const mapDispatchToProps = dispatch => {
   return {
     uploadFile: file => dispatch(uploadsActions.uploadFile(file)),
-    showMakeBucketModal: () => dispatch(actionsBuckets.showMakeBucketModal())
   }
 }
 
