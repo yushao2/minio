@@ -31,6 +31,11 @@ var (
 			Key:         ClientID,
 			Description: `unique public identifier for apps e.g. "292085223830.apps.googleusercontent.com"`,
 			Type:        "string",
+		},
+		config.HelpKV{
+			Key:         ClientSecret,
+			Description: `secret for the unique public identifier for apps e.g.`,
+			Type:        "string",
 			Optional:    true,
 		},
 		config.HelpKV{
@@ -40,8 +45,20 @@ var (
 			Type:        "string",
 		},
 		config.HelpKV{
+			Key:         ClaimUserinfo,
+			Description: `Enable fetching claims from UserInfo Endpoint for authenticated user`,
+			Optional:    true,
+			Type:        "on|off",
+		},
+		config.HelpKV{
 			Key:         ClaimPrefix,
-			Description: `JWT claim namespace prefix e.g. "customer1/"`,
+			Description: `[DEPRECATED use 'claim_name'] JWT claim namespace prefix e.g. "customer1/"`,
+			Optional:    true,
+			Type:        "string",
+		},
+		config.HelpKV{
+			Key:         RedirectURI,
+			Description: `[DEPRECATED use env 'MINIO_BROWSER_REDIRECT_URL'] Configure custom redirect_uri for OpenID login flow callback`,
 			Optional:    true,
 			Type:        "string",
 		},
@@ -50,6 +67,24 @@ var (
 			Description: `Comma separated list of OpenID scopes for server, defaults to advertised scopes from discovery document e.g. "email,admin"`,
 			Optional:    true,
 			Type:        "csv",
+		},
+		config.HelpKV{
+			Key:         Vendor,
+			Description: `Specify vendor type for vendor specific behavior to checking validity of temporary credentials and service accounts on MinIO`,
+			Optional:    true,
+			Type:        "string",
+		},
+		config.HelpKV{
+			Key:         KeyCloakRealm,
+			Description: `Specify Keycloak 'realm' name, only honored if vendor was set to 'keycloak' as value, if no realm is specified 'master' is default`,
+			Optional:    true,
+			Type:        "string",
+		},
+		config.HelpKV{
+			Key:         KeyCloakAdminURL,
+			Description: `Specify Keycloak 'admin' REST API endpoint e.g. http://localhost:8080/auth/admin/`,
+			Optional:    true,
+			Type:        "string",
 		},
 		config.HelpKV{
 			Key:         config.Comment,

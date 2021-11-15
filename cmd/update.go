@@ -37,8 +37,8 @@ import (
 
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
-	xnet "github.com/minio/minio/internal/net"
 	"github.com/minio/pkg/env"
+	xnet "github.com/minio/pkg/net"
 	"github.com/minio/selfupdate"
 )
 
@@ -148,11 +148,6 @@ func IsDCOS() bool {
 		return env.Get("MESOS_CONTAINER_NAME", "") != ""
 	}
 	return false
-}
-
-// IsKubernetesReplicaSet returns true if minio is running in kubernetes replica set.
-func IsKubernetesReplicaSet() bool {
-	return IsKubernetes() && (env.Get("KUBERNETES_REPLICA_SET", "") != "")
 }
 
 // IsKubernetes returns true if minio is running in kubernetes.
@@ -466,7 +461,7 @@ func getDownloadURL(releaseTag string) (downloadURL string) {
 	// Check if we are docker environment, return docker update command
 	if IsDocker() {
 		// Construct release tag name.
-		return fmt.Sprintf("docker pull minio/minio:%s", releaseTag)
+		return fmt.Sprintf("podman pull quay.io/minio/minio:%s", releaseTag)
 	}
 
 	// For binary only installations, we return link to the latest binary.
@@ -540,6 +535,14 @@ func doUpdate(u *url.URL, lrTime time.Time, sha256Sum []byte, releaseInfo string
 	opts := selfupdate.Options{
 		Hash:     crypto.SHA256,
 		Checksum: sha256Sum,
+	}
+
+	if err := opts.CheckPermissions(); err != nil {
+		return AdminError{
+			Code:       AdminUpdateApplyFailure,
+			Message:    fmt.Sprintf("server update failed with: %s, do not restart the servers yet", err),
+			StatusCode: http.StatusInternalServerError,
+		}
 	}
 
 	minisignPubkey := env.Get(envMinisignPubKey, "")

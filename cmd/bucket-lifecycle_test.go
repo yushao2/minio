@@ -19,7 +19,6 @@ package cmd
 
 import (
 	"bytes"
-	"context"
 	"net/http"
 	"testing"
 	"time"
@@ -240,7 +239,7 @@ func TestValidateTransitionTier(t *testing.T) {
 			t.Fatalf("Test %d: Failed to parse lifecycle config %v", i+1, err)
 		}
 
-		err = validateTransitionTier(context.Background(), lc)
+		err = validateTransitionTier(lc)
 		if err != tc.expectedErr {
 			t.Fatalf("Test %d: Expected %v but got %v", i+1, tc.expectedErr, err)
 		}

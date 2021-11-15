@@ -96,7 +96,7 @@ func formatErasureCleanupTmp(diskPath string) error {
 	// Removal of tmp-old folder is backgrounded completely.
 	go removeAll(pathJoin(diskPath, minioMetaTmpBucket+"-old"))
 
-	if err := mkdirAll(pathJoin(diskPath, minioMetaTmpBucket), 0777); err != nil {
+	if err := mkdirAll(pathJoin(diskPath, minioMetaTmpDeletedBucket), 0777); err != nil {
 		logger.LogIf(GlobalContext, fmt.Errorf("unable to create (%s) %w, drive may be faulty please investigate",
 			pathJoin(diskPath, minioMetaTmpBucket),
 			err))
@@ -177,6 +177,13 @@ func connectLoadInitFormats(retryCount int, firstDisk bool, endpoints Endpoints,
 			closeStorageDisks(storageDisks)
 		}
 	}(storageDisks)
+
+	// Sanitize all local disks during server startup.
+	for _, disk := range storageDisks {
+		if disk != nil && disk.IsLocal() {
+			disk.(*xlStorageDiskIDCheck).storage.(*xlStorage).Sanitize()
+		}
+	}
 
 	for i, err := range errs {
 		if err != nil {
@@ -321,7 +328,13 @@ func waitForFormatErasure(firstDisk bool, endpoints Endpoints, poolCount, setCou
 					continue
 				case errErasureReadQuorum:
 					// no quorum available continue to wait for minimum number of servers.
-					logger.Info("Waiting for a minimum of %d disks to come online (elapsed %s)\n", len(endpoints)/2, getElapsedTime())
+					logger.Info("Waiting for a minimum of %d disks to come online (elapsed %s)\n",
+						len(endpoints)/2, getElapsedTime())
+					continue
+				case errErasureWriteQuorum:
+					// no quorum available continue to wait for minimum number of servers.
+					logger.Info("Waiting for a minimum of %d disks to come online (elapsed %s)\n",
+						(len(endpoints)/2)+1, getElapsedTime())
 					continue
 				case errErasureV3ThisEmpty:
 					// need to wait for this error to be healed, so continue.

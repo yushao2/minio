@@ -35,6 +35,12 @@ var (
 			Type:        "duration",
 		},
 		config.HelpKV{
+			Key:         apiClusterDeadline,
+			Description: `set the deadline for cluster readiness check e.g. "10s"`,
+			Optional:    true,
+			Type:        "duration",
+		},
+		config.HelpKV{
 			Key:         apiCorsAllowOrigin,
 			Description: `set comma separated list of origins allowed for CORS requests e.g. "https://example1.com,https://example2.com"`,
 			Optional:    true,
@@ -47,6 +53,12 @@ var (
 			Type:        "duration",
 		},
 		config.HelpKV{
+			Key:         apiListQuorum,
+			Description: `set the acceptable quorum expected for list operations e.g. "optimal", "reduced", "disk", "strict", defaults to "strict"`,
+			Optional:    true,
+			Type:        "string",
+		},
+		config.HelpKV{
 			Key:         apiReplicationWorkers,
 			Description: `set the number of replication workers, defaults to 100`,
 			Optional:    true,
@@ -57,6 +69,30 @@ var (
 			Description: `set the number of replication workers for recently failed replicas, defaults to 4`,
 			Optional:    true,
 			Type:        "number",
+		},
+		config.HelpKV{
+			Key:         apiTransitionWorkers,
+			Description: `set the number of transition workers, defaults to 100`,
+			Optional:    true,
+			Type:        "number",
+		},
+		config.HelpKV{
+			Key:         apiStaleUploadsExpiry,
+			Description: `set to expire stale multipart uploads older than this value, defaults to 24 hours`,
+			Optional:    true,
+			Type:        "duration",
+		},
+		config.HelpKV{
+			Key:         apiStaleUploadsCleanupInterval,
+			Description: `set to change intervals when stale multipart uploads are expired, defaults to every 6 hours`,
+			Optional:    true,
+			Type:        "duration",
+		},
+		config.HelpKV{
+			Key:         apiDeleteCleanupInterval,
+			Description: `set to change intervals when deleted objects are permanently deleted from ".trash" folder, defaults to every 5 minutes`,
+			Optional:    true,
+			Type:        "duration",
 		},
 	}
 )

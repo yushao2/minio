@@ -20,7 +20,6 @@ package cmd
 import (
 	"bytes"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"reflect"
@@ -30,11 +29,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gorilla/mux"
 	"github.com/minio/madmin-go"
 	"github.com/minio/minio/internal/handlers"
 	"github.com/minio/minio/internal/logger"
-	jsonrpc "github.com/minio/rpc"
 )
 
 // recordRequest - records the first recLen bytes
@@ -52,6 +49,11 @@ type recordRequest struct {
 	bytesRead int
 }
 
+func (r *recordRequest) Close() error {
+	// no-op
+	return nil
+}
+
 func (r *recordRequest) Read(p []byte) (n int, err error) {
 	n, err = r.Reader.Read(p)
 	r.bytesRead += n
@@ -64,6 +66,7 @@ func (r *recordRequest) Read(p []byte) (n int, err error) {
 	}
 	return n, err
 }
+
 func (r *recordRequest) Size() int {
 	sz := r.bytesRead
 	for k, v := range r.headers {
@@ -110,75 +113,6 @@ func getOpName(name string) (op string) {
 	return op
 }
 
-// WebTrace gets trace of web request
-func WebTrace(ri *jsonrpc.RequestInfo) madmin.TraceInfo {
-	r := ri.Request
-	w := ri.ResponseWriter
-
-	name := ri.Method
-	// Setup a http request body recorder
-	reqHeaders := r.Header.Clone()
-	reqHeaders.Set("Host", r.Host)
-	if len(r.TransferEncoding) == 0 {
-		reqHeaders.Set("Content-Length", strconv.Itoa(int(r.ContentLength)))
-	} else {
-		reqHeaders.Set("Transfer-Encoding", strings.Join(r.TransferEncoding, ","))
-	}
-
-	now := time.Now().UTC()
-	t := madmin.TraceInfo{TraceType: madmin.TraceHTTP, FuncName: name, Time: now}
-	t.NodeName = r.Host
-	if globalIsDistErasure {
-		t.NodeName = globalLocalNodeName
-	}
-	if t.NodeName == "" {
-		t.NodeName = globalLocalNodeName
-	}
-
-	// strip only standard port from the host address
-	if host, port, err := net.SplitHostPort(t.NodeName); err == nil {
-		if port == "443" || port == "80" {
-			t.NodeName = host
-		}
-	}
-
-	vars := mux.Vars(r)
-	rq := madmin.TraceRequestInfo{
-		Time:     now,
-		Proto:    r.Proto,
-		Method:   r.Method,
-		Path:     SlashSeparator + pathJoin(vars["bucket"], vars["object"]),
-		RawQuery: redactLDAPPwd(r.URL.RawQuery),
-		Client:   handlers.GetSourceIP(r),
-		Headers:  reqHeaders,
-	}
-
-	rw, ok := w.(*logger.ResponseWriter)
-	if ok {
-		rs := madmin.TraceResponseInfo{
-			Time:       time.Now().UTC(),
-			Headers:    rw.Header().Clone(),
-			StatusCode: rw.StatusCode,
-			Body:       logger.BodyPlaceHolder,
-		}
-
-		if rs.StatusCode == 0 {
-			rs.StatusCode = http.StatusOK
-		}
-
-		t.RespInfo = rs
-		t.CallStats = madmin.TraceCallStats{
-			Latency:         rs.Time.Sub(rw.StartTime),
-			InputBytes:      int(r.ContentLength),
-			OutputBytes:     rw.Size(),
-			TimeToFirstByte: rw.TimeToFirstByte,
-		}
-	}
-
-	t.ReqInfo = rq
-	return t
-}
-
 // Trace gets trace of http request
 func Trace(f http.HandlerFunc, logBody bool, w http.ResponseWriter, r *http.Request) madmin.TraceInfo {
 	name := getOpName(runtime.FuncForPC(reflect.ValueOf(f).Pointer()).Name())
@@ -193,7 +127,7 @@ func Trace(f http.HandlerFunc, logBody bool, w http.ResponseWriter, r *http.Requ
 	}
 
 	reqBodyRecorder := &recordRequest{Reader: r.Body, logBody: logBody, headers: reqHeaders}
-	r.Body = ioutil.NopCloser(reqBodyRecorder)
+	r.Body = reqBodyRecorder
 
 	now := time.Now().UTC()
 	t := madmin.TraceInfo{TraceType: madmin.TraceHTTP, FuncName: name, Time: now}

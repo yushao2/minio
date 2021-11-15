@@ -30,8 +30,6 @@ import (
 	"strings"
 	"syscall"
 	"testing"
-
-	"github.com/minio/minio/internal/config/storageclass"
 )
 
 func TestCheckPathLength(t *testing.T) {
@@ -251,6 +249,36 @@ func TestXLStorageIsDirEmpty(t *testing.T) {
 	}
 }
 
+func TestXLStorageReadVersionLegacy(t *testing.T) {
+	const legacyJSON = `{"version":"1.0.1","format":"xl","stat":{"size":2016,"modTime":"2021-10-11T23:40:34.914361617Z"},"erasure":{"algorithm":"klauspost/reedsolomon/vandermonde","data":2,"parity":2,"blockSize":10485760,"index":2,"distribution":[2,3,4,1],"checksum":[{"name":"part.1","algorithm":"highwayhash256S"}]},"minio":{"release":"RELEASE.2019-12-30T05-45-39Z"},"meta":{"X-Minio-Internal-Server-Side-Encryption-Iv":"kInsJB/0yxyz/40ZI+lmQYJfZacDYqZsGh2wEiv+N50=","X-Minio-Internal-Server-Side-Encryption-S3-Kms-Key-Id":"my-minio-key","X-Minio-Internal-Server-Side-Encryption-S3-Kms-Sealed-Key":"eyJhZWFkIjoiQUVTLTI1Ni1HQ00tSE1BQy1TSEEtMjU2IiwiaWQiOiJjMzEwNDVjODFmMTA2MWU5NTI4ODcxZmNhMmRkYzA3YyIsIml2IjoiOWQ5cUxGMFhSaFBXbEVqT2JDMmo0QT09Iiwibm9uY2UiOiJYaERsemlCU1cwSENuK2RDIiwiYnl0ZXMiOiJUM0lmY1haQ1dtMWpLeWxBWmFUUnczbDVoYldLWW95dm5iNTZVaWJEbE5LOFZVU2tuQmx3NytIMG8yZnRzZ1UrIn0=","X-Minio-Internal-Server-Side-Encryption-S3-Sealed-Key":"IAAfANqt801MT+wwzQRkfFhTrndmhfNiN0alKwDS4AQ1dznNADRQgoq6I4pPVfRsbDp5rQawlripQZvPWUSNJA==","X-Minio-Internal-Server-Side-Encryption-Seal-Algorithm":"DAREv2-HMAC-SHA256","content-type":"application/octet-stream","etag":"20000f00cf5e68d3d6b60e44fcd8b9e8-1"},"parts":[{"number":1,"name":"part.1","etag":"","size":2016,"actualSize":1984}]}`
+
+	// create xlStorage test setup
+	xlStorage, path, err := newXLStorageTestSetup()
+	if err != nil {
+		t.Fatalf("Unable to cfgreate xlStorage test setup, %s", err)
+	}
+
+	defer os.RemoveAll(path)
+
+	// Create files for the test cases.
+	if err = xlStorage.MakeVol(context.Background(), "exists-legacy"); err != nil {
+		t.Fatalf("Unable to create a volume \"exists-legacy\", %s", err)
+	}
+
+	if err = xlStorage.AppendFile(context.Background(), "exists-legacy", "as-file/xl.json", []byte(legacyJSON)); err != nil {
+		t.Fatalf("Unable to create a file \"as-file\", %s", err)
+	}
+
+	fi, err := xlStorage.ReadVersion(context.Background(), "exists-legacy", "as-file", "", false)
+	if err != nil {
+		t.Fatalf("Unable to read older 'xl.json' content: %s", err)
+	}
+
+	if !fi.XLV1 {
+		t.Fatal("Unexpected 'xl.json' content should be correctly interpreted as legacy content")
+	}
+}
+
 // TestXLStorageReadVersion - TestXLStorages the functionality implemented by xlStorage ReadVersion storage API.
 func TestXLStorageReadVersion(t *testing.T) {
 	// create xlStorage test setup
@@ -415,7 +443,8 @@ func TestXLStorageReadAll(t *testing.T) {
 	for i, testCase := range testCases {
 		dataRead, err = xlStorage.ReadAll(context.Background(), testCase.volume, testCase.path)
 		if err != testCase.err {
-			t.Fatalf("TestXLStorage %d: Expected err \"%s\", got err \"%s\"", i+1, testCase.err, err)
+			t.Errorf("TestXLStorage %d: Expected err \"%v\", got err \"%v\"", i+1, testCase.err, err)
+			continue
 		}
 		if err == nil {
 			if string(dataRead) != string([]byte("Hello, World")) {
@@ -1152,10 +1181,6 @@ func TestXLStorageReadFile(t *testing.T) {
 	}
 
 	for l := 0; l < 2; l++ {
-		// 1st loop tests with dma=write, 2nd loop tests with dma=read-write.
-		if l == 1 {
-			globalStorageClass.DMA = storageclass.DMAReadWrite
-		}
 		// Following block validates all ReadFile test cases.
 		for i, testCase := range testCases {
 			var n int64
@@ -1212,9 +1237,6 @@ func TestXLStorageReadFile(t *testing.T) {
 			}
 		}
 	}
-
-	// Reset the flag.
-	globalStorageClass.DMA = storageclass.DMAWrite
 
 	// TestXLStorage for permission denied.
 	if runtime.GOOS != globalWindowsOSName {
@@ -1637,8 +1659,8 @@ func TestXLStorageRenameFile(t *testing.T) {
 	}
 }
 
-// TestXLStorage xlStorage.CheckFile()
-func TestXLStorageCheckFile(t *testing.T) {
+// TestXLStorage xlStorage.StatInfoFile()
+func TestXLStorageStatInfoFile(t *testing.T) {
 	// create xlStorage test setup
 	xlStorage, path, err := newXLStorageTestSetup()
 	if err != nil {
@@ -1708,19 +1730,20 @@ func TestXLStorageCheckFile(t *testing.T) {
 		{
 			srcVol:      "non-existent-vol",
 			srcPath:     "success-file",
-			expectedErr: errPathNotFound,
+			expectedErr: errVolumeNotFound,
 		},
 		// TestXLStorage case - 7.
 		// TestXLStorage case with file with directory.
 		{
 			srcVol:      "success-vol",
 			srcPath:     "path/to",
-			expectedErr: errFileNotFound,
+			expectedErr: nil,
 		},
 	}
 
 	for i, testCase := range testCases {
-		if err := xlStorage.CheckFile(context.Background(), testCase.srcVol, testCase.srcPath); err != testCase.expectedErr {
+		_, err := xlStorage.StatInfoFile(context.Background(), testCase.srcVol, testCase.srcPath+"/"+xlStorageFormatFile, false)
+		if err != testCase.expectedErr {
 			t.Errorf("TestXLStorage case %d: Expected: \"%s\", got: \"%s\"", i+1, testCase.expectedErr, err)
 		}
 	}
@@ -1824,5 +1847,25 @@ func TestXLStorageVerifyFile(t *testing.T) {
 	}
 	if err := storage.storage.(*xlStorage).bitrotVerify(pathJoin(path, volName, fileName), size+1, algo, nil, shardSize); err == nil {
 		t.Fatal("expected to fail bitrot check")
+	}
+}
+
+// TestXLStorageReadMetadata tests readMetadata
+func TestXLStorageReadMetadata(t *testing.T) {
+	volume, object := "test-vol", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	tmpDir, err := ioutil.TempDir("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	disk, err := newLocalXLStorage(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	disk.MakeVol(context.Background(), volume)
+	if _, err := disk.readMetadata(context.Background(), pathJoin(tmpDir, volume, object)); err != errFileNameTooLong {
+		t.Fatalf("Unexpected error from readMetadata - expect %v: got %v", errFileNameTooLong, err)
 	}
 }

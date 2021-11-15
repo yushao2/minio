@@ -24,8 +24,10 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/minio/minio/internal/bucket/lifecycle"
 	"github.com/minio/minio/internal/logger"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -68,6 +70,8 @@ const (
 	softwareSubsystem         MetricSubsystem = "software"
 	sysCallSubsystem          MetricSubsystem = "syscall"
 	usageSubsystem            MetricSubsystem = "usage"
+	ilmSubsystem              MetricSubsystem = "ilm"
+	scannerSubsystem          MetricSubsystem = "scanner"
 )
 
 // MetricName are the individual names for the metric.
@@ -121,6 +125,10 @@ const (
 	upTime           = "uptime_seconds"
 	memory           = "resident_memory_bytes"
 	cpu              = "cpu_total_seconds"
+
+	expiryPendingTasks     MetricName = "expiry_pending_tasks"
+	transitionPendingTasks MetricName = "transition_pending_tasks"
+	transitionActiveTasks  MetricName = "transition_active_tasks"
 )
 
 const (
@@ -249,6 +257,8 @@ func GetGeneratorsForPeer() []MetricsGenerator {
 		getMinioVersionMetrics,
 		getNetworkMetrics,
 		getS3TTFBMetric,
+		getILMNodeMetrics,
+		getScannerNodeMetrics,
 	}
 	return g
 }
@@ -1000,6 +1010,155 @@ func getS3TTFBMetric() MetricsGroup {
 	}
 }
 
+func getTransitionPendingTasksMD() MetricDescription {
+	return MetricDescription{
+		Namespace: nodeMetricNamespace,
+		Subsystem: ilmSubsystem,
+		Name:      transitionPendingTasks,
+		Help:      "Number of pending ILM transition tasks in the queue.",
+		Type:      gaugeMetric,
+	}
+}
+
+func getTransitionActiveTasksMD() MetricDescription {
+	return MetricDescription{
+		Namespace: nodeMetricNamespace,
+		Subsystem: ilmSubsystem,
+		Name:      transitionActiveTasks,
+		Help:      "Number of active ILM transition tasks.",
+		Type:      gaugeMetric,
+	}
+}
+
+func getExpiryPendingTasksMD() MetricDescription {
+	return MetricDescription{
+		Namespace: nodeMetricNamespace,
+		Subsystem: ilmSubsystem,
+		Name:      expiryPendingTasks,
+		Help:      "Number of pending ILM expiry tasks in the queue.",
+		Type:      gaugeMetric,
+	}
+}
+
+func getILMNodeMetrics() MetricsGroup {
+	return MetricsGroup{
+		id:         "ILMNodeMetrics",
+		cachedRead: cachedRead,
+		read: func(_ context.Context) []Metric {
+			expPendingTasks := Metric{
+				Description: getExpiryPendingTasksMD(),
+			}
+			trPendingTasks := Metric{
+				Description: getTransitionPendingTasksMD(),
+			}
+			trActiveTasks := Metric{
+				Description: getTransitionActiveTasksMD(),
+			}
+			if globalExpiryState != nil {
+				expPendingTasks.Value = float64(globalExpiryState.PendingTasks())
+			}
+			if globalTransitionState != nil {
+				trPendingTasks.Value = float64(globalTransitionState.PendingTasks())
+				trActiveTasks.Value = float64(globalTransitionState.ActiveTasks())
+			}
+			return []Metric{
+				expPendingTasks,
+				trPendingTasks,
+				trActiveTasks,
+			}
+		},
+	}
+}
+
+func getScannerNodeMetrics() MetricsGroup {
+	return MetricsGroup{
+		id:         "ScannerNodeMetrics",
+		cachedRead: cachedRead,
+		read: func(_ context.Context) []Metric {
+			metrics := []Metric{
+				{
+					Description: MetricDescription{
+						Namespace: nodeMetricNamespace,
+						Subsystem: scannerSubsystem,
+						Name:      "objects_scanned",
+						Help:      "Total number of unique objects scanned since server start.",
+						Type:      counterMetric,
+					},
+					Value: float64(atomic.LoadUint64(&globalScannerStats.accTotalObjects)),
+				},
+				{
+					Description: MetricDescription{
+						Namespace: nodeMetricNamespace,
+						Subsystem: scannerSubsystem,
+						Name:      "versions_scanned",
+						Help:      "Total number of object versions scanned since server start.",
+						Type:      counterMetric,
+					},
+					Value: float64(atomic.LoadUint64(&globalScannerStats.accTotalVersions)),
+				},
+				{
+					Description: MetricDescription{
+						Namespace: nodeMetricNamespace,
+						Subsystem: scannerSubsystem,
+						Name:      "directories_scanned",
+						Help:      "Total number of directories scanned since server start.",
+						Type:      counterMetric,
+					},
+					Value: float64(atomic.LoadUint64(&globalScannerStats.accFolders)),
+				},
+				{
+					Description: MetricDescription{
+						Namespace: nodeMetricNamespace,
+						Subsystem: scannerSubsystem,
+						Name:      "bucket_scans_started",
+						Help:      "Total number of bucket scans started since server start",
+						Type:      counterMetric,
+					},
+					Value: float64(atomic.LoadUint64(&globalScannerStats.bucketsStarted)),
+				},
+				{
+					Description: MetricDescription{
+						Namespace: nodeMetricNamespace,
+						Subsystem: scannerSubsystem,
+						Name:      "bucket_scans_finished",
+						Help:      "Total number of bucket scans finished since server start",
+						Type:      counterMetric,
+					},
+					Value: float64(atomic.LoadUint64(&globalScannerStats.bucketsFinished)),
+				},
+				{
+					Description: MetricDescription{
+						Namespace: nodeMetricNamespace,
+						Subsystem: ilmSubsystem,
+						Name:      "versions_scanned",
+						Help:      "Total number of object versions checked for ilm actions since server start",
+						Type:      counterMetric,
+					},
+					Value: float64(atomic.LoadUint64(&globalScannerStats.ilmChecks)),
+				},
+			}
+			for i := range globalScannerStats.actions {
+				action := lifecycle.Action(i)
+				v := atomic.LoadUint64(&globalScannerStats.actions[action])
+				if v == 0 {
+					continue
+				}
+				metrics = append(metrics, Metric{
+					Description: MetricDescription{
+						Namespace: nodeMetricNamespace,
+						Subsystem: ilmSubsystem,
+						Name:      MetricName("action_count_" + toSnake(action.String())),
+						Help:      "Total action outcome of lifecycle checks since server start",
+						Type:      counterMetric,
+					},
+					Value: float64(v),
+				})
+			}
+			return metrics
+		},
+	}
+}
+
 func getMinioVersionMetrics() MetricsGroup {
 	return MetricsGroup{
 		id:         "MinioVersionMetrics",
@@ -1064,7 +1223,7 @@ func getMinioHealingMetrics() MetricsGroup {
 				Value:       float64(time.Since(bgSeq.lastHealActivity)),
 			})
 			metrics = append(metrics, getObjectsScanned(bgSeq)...)
-			metrics = append(metrics, getScannedItems(bgSeq)...)
+			metrics = append(metrics, getHealedItems(bgSeq)...)
 			metrics = append(metrics, getFailedItems(bgSeq)...)
 			return
 		},
@@ -1087,7 +1246,7 @@ func getFailedItems(seq *healSequence) (m []Metric) {
 	return
 }
 
-func getScannedItems(seq *healSequence) (m []Metric) {
+func getHealedItems(seq *healSequence) (m []Metric) {
 	items := seq.getHealedItemsMap()
 	m = make([]Metric, 0, len(items))
 	for k, v := range items {
@@ -1101,9 +1260,9 @@ func getScannedItems(seq *healSequence) (m []Metric) {
 }
 
 func getObjectsScanned(seq *healSequence) (m []Metric) {
-	items := seq.getHealedItemsMap()
+	items := seq.getScannedItemsMap()
 	m = make([]Metric, 0, len(items))
-	for k, v := range seq.getScannedItemsMap() {
+	for k, v := range items {
 		m = append(m, Metric{
 			Description:    getHealObjectsTotalMD(),
 			VariableLabels: map[string]string{"type": string(k)},
@@ -1112,6 +1271,7 @@ func getObjectsScanned(seq *healSequence) (m []Metric) {
 	}
 	return
 }
+
 func getCacheMetrics() MetricsGroup {
 	return MetricsGroup{
 		id:         "CacheMetrics",
@@ -1285,7 +1445,7 @@ func getBucketUsageMetrics() MetricsGroup {
 			})
 
 			for bucket, usage := range dataUsageInfo.BucketsUsage {
-				stat := getLatestReplicationStats(bucket, usage)
+				stats := getLatestReplicationStats(bucket, usage)
 
 				metrics = append(metrics, Metric{
 					Description:    getBucketUsageTotalBytesMD(),
@@ -1299,27 +1459,30 @@ func getBucketUsageMetrics() MetricsGroup {
 					VariableLabels: map[string]string{"bucket": bucket},
 				})
 
-				if stat.hasReplicationUsage() {
-					metrics = append(metrics, Metric{
-						Description:    getBucketRepFailedBytesMD(),
-						Value:          float64(stat.FailedSize),
-						VariableLabels: map[string]string{"bucket": bucket},
-					})
-					metrics = append(metrics, Metric{
-						Description:    getBucketRepSentBytesMD(),
-						Value:          float64(stat.ReplicatedSize),
-						VariableLabels: map[string]string{"bucket": bucket},
-					})
-					metrics = append(metrics, Metric{
-						Description:    getBucketRepReceivedBytesMD(),
-						Value:          float64(stat.ReplicaSize),
-						VariableLabels: map[string]string{"bucket": bucket},
-					})
-					metrics = append(metrics, Metric{
-						Description:    getBucketRepFailedOperationsMD(),
-						Value:          float64(stat.FailedCount),
-						VariableLabels: map[string]string{"bucket": bucket},
-					})
+				metrics = append(metrics, Metric{
+					Description:    getBucketRepReceivedBytesMD(),
+					Value:          float64(stats.ReplicaSize),
+					VariableLabels: map[string]string{"bucket": bucket},
+				})
+
+				if stats.hasReplicationUsage() {
+					for arn, stat := range stats.Stats {
+						metrics = append(metrics, Metric{
+							Description:    getBucketRepFailedBytesMD(),
+							Value:          float64(stat.FailedSize),
+							VariableLabels: map[string]string{"bucket": bucket, "targetArn": arn},
+						})
+						metrics = append(metrics, Metric{
+							Description:    getBucketRepSentBytesMD(),
+							Value:          float64(stat.ReplicatedSize),
+							VariableLabels: map[string]string{"bucket": bucket, "targetArn": arn},
+						})
+						metrics = append(metrics, Metric{
+							Description:    getBucketRepFailedOperationsMD(),
+							Value:          float64(stat.FailedCount),
+							VariableLabels: map[string]string{"bucket": bucket, "targetArn": arn},
+						})
+					}
 				}
 
 				metrics = append(metrics, Metric{
@@ -1683,4 +1846,27 @@ func metricsNodeHandler() http.Handler {
 				ErrorHandling: promhttp.ContinueOnError,
 			}),
 	)
+}
+
+func toSnake(camel string) (snake string) {
+	var b strings.Builder
+	l := len(camel)
+	for i, v := range camel {
+		// A is 65, a is 97
+		if v >= 'a' {
+			b.WriteRune(v)
+			continue
+		}
+		// v is capital letter here
+		// disregard first letter
+		// add underscore if last letter is capital letter
+		// add underscore when previous letter is lowercase
+		// add underscore when next letter is lowercase
+		if (i != 0 || i == l-1) && ((i > 0 && rune(camel[i-1]) >= 'a') ||
+			(i < l-1 && rune(camel[i+1]) >= 'a')) {
+			b.WriteRune('_')
+		}
+		b.WriteRune(v + 'a' - 'A')
+	}
+	return b.String()
 }

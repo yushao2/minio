@@ -20,19 +20,7 @@ package cmd
 import (
 	"context"
 	"sync"
-
-	"github.com/minio/minio/internal/sync/errgroup"
 )
-
-func (er erasureObjects) getLocalDisks() (localDisks []StorageAPI) {
-	disks := er.getDisks()
-	for _, disk := range disks {
-		if disk != nil && disk.IsLocal() {
-			localDisks = append(localDisks, disk)
-		}
-	}
-	return localDisks
-}
 
 func (er erasureObjects) getLoadBalancedLocalDisks() (newDisks []StorageAPI) {
 	disks := er.getDisks()
@@ -44,39 +32,6 @@ func (er erasureObjects) getLoadBalancedLocalDisks() (newDisks []StorageAPI) {
 			}
 		}
 	}
-	return newDisks
-}
-
-func (er erasureObjects) getOnlineDisks() (newDisks []StorageAPI) {
-	disks := er.getDisks()
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	for _, i := range hashOrder(UTCNow().String(), len(disks)) {
-		i := i
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if disks[i-1] == nil {
-				return
-			}
-			di, err := disks[i-1].DiskInfo(context.Background())
-			if err != nil || di.Healing {
-
-				// - Do not consume disks which are not reachable
-				//   unformatted or simply not accessible for some reason.
-				//
-				// - Do not consume disks which are being healed
-				//
-				// - Future: skip busy disks
-				return
-			}
-
-			mu.Lock()
-			newDisks = append(newDisks, disks[i-1])
-			mu.Unlock()
-		}()
-	}
-	wg.Wait()
 	return newDisks
 }
 
@@ -133,35 +88,4 @@ func (er erasureObjects) getLoadBalancedDisks(optimized bool) []StorageAPI {
 
 	// Return disks which have maximum disk usage common.
 	return newDisks[max]
-}
-
-// This function does the following check, suppose
-// object is "a/b/c/d", stat makes sure that objects
-// - "a/b/c"
-// - "a/b"
-// - "a"
-// do not exist on the namespace.
-func (er erasureObjects) parentDirIsObject(ctx context.Context, bucket, parent string) bool {
-	storageDisks := er.getDisks()
-
-	g := errgroup.WithNErrs(len(storageDisks))
-
-	for index := range storageDisks {
-		index := index
-		g.Go(func() error {
-			if storageDisks[index] == nil {
-				return errDiskNotFound
-			}
-			// Check if 'prefix' is an object on this 'disk', else continue the check the next disk
-			return storageDisks[index].CheckFile(ctx, bucket, parent)
-		}, index)
-	}
-
-	// NOTE: Observe we are not trying to read `xl.meta` and figure out the actual
-	// quorum intentionally, but rely on the default case scenario. Actual quorum
-	// verification will happen by top layer by using getObjectInfo() and will be
-	// ignored if necessary.
-	readQuorum := getReadQuorum(len(storageDisks))
-
-	return reduceReadQuorumErrs(ctx, g.Wait(), objectOpIgnoredErrs, readQuorum) == nil
 }

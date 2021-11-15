@@ -26,8 +26,7 @@ import (
 	"testing"
 
 	"github.com/gorilla/mux"
-	"github.com/minio/minio/internal/config"
-	xnet "github.com/minio/minio/internal/net"
+	xnet "github.com/minio/pkg/net"
 )
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -166,7 +165,7 @@ func testStorageAPIDeleteVol(t *testing.T, storage StorageAPI) {
 	}
 }
 
-func testStorageAPICheckFile(t *testing.T, storage StorageAPI) {
+func testStorageAPIStatInfoFile(t *testing.T, storage StorageAPI) {
 	err := storage.MakeVol(context.Background(), "foo")
 	if err != nil {
 		t.Fatalf("unexpected error %v", err)
@@ -187,11 +186,11 @@ func testStorageAPICheckFile(t *testing.T, storage StorageAPI) {
 	}
 
 	for i, testCase := range testCases {
-		err := storage.CheckFile(context.Background(), testCase.volumeName, testCase.objectName)
+		_, err := storage.StatInfoFile(context.Background(), testCase.volumeName, testCase.objectName+"/"+xlStorageFormatFile, false)
 		expectErr := (err != nil)
 
 		if expectErr != testCase.expectErr {
-			t.Fatalf("case %v: error: expected: %v, got: %v", i+1, testCase.expectErr, expectErr)
+			t.Fatalf("case %v: error: expected: %v, got: %v, err: %v", i+1, expectErr, testCase.expectErr, err)
 		}
 	}
 }
@@ -416,7 +415,7 @@ func testStorageAPIRenameFile(t *testing.T, storage StorageAPI) {
 	}
 }
 
-func newStorageRESTHTTPServerClient(t *testing.T) (*httptest.Server, *storageRESTClient, config.Config, string) {
+func newStorageRESTHTTPServerClient(t *testing.T) (*httptest.Server, *storageRESTClient, string) {
 	prevHost, prevPort := globalMinioHost, globalMinioPort
 	defer func() {
 		globalMinioHost, globalMinioPort = prevHost, prevPort
@@ -451,142 +450,102 @@ func newStorageRESTHTTPServerClient(t *testing.T) (*httptest.Server, *storageRES
 		Endpoints: Endpoints{endpoint},
 	}})
 
-	prevGlobalServerConfig := globalServerConfig
-	globalServerConfig = newServerConfig()
-	lookupConfigs(globalServerConfig, nil)
-
 	restClient := newStorageRESTClient(endpoint, false)
 
-	return httpServer, restClient, prevGlobalServerConfig, endpointPath
+	return httpServer, restClient, endpointPath
 }
 
 func TestStorageRESTClientDiskInfo(t *testing.T) {
-	httpServer, restClient, prevGlobalServerConfig, endpointPath := newStorageRESTHTTPServerClient(t)
+	httpServer, restClient, endpointPath := newStorageRESTHTTPServerClient(t)
 	defer httpServer.Close()
-	defer func() {
-		globalServerConfig = prevGlobalServerConfig
-	}()
 	defer os.RemoveAll(endpointPath)
 
 	testStorageAPIDiskInfo(t, restClient)
 }
 
 func TestStorageRESTClientMakeVol(t *testing.T) {
-	httpServer, restClient, prevGlobalServerConfig, endpointPath := newStorageRESTHTTPServerClient(t)
+	httpServer, restClient, endpointPath := newStorageRESTHTTPServerClient(t)
 	defer httpServer.Close()
-	defer func() {
-		globalServerConfig = prevGlobalServerConfig
-	}()
 	defer os.RemoveAll(endpointPath)
 
 	testStorageAPIMakeVol(t, restClient)
 }
 
 func TestStorageRESTClientListVols(t *testing.T) {
-	httpServer, restClient, prevGlobalServerConfig, endpointPath := newStorageRESTHTTPServerClient(t)
+	httpServer, restClient, endpointPath := newStorageRESTHTTPServerClient(t)
 	defer httpServer.Close()
-	defer func() {
-		globalServerConfig = prevGlobalServerConfig
-	}()
 	defer os.RemoveAll(endpointPath)
 
 	testStorageAPIListVols(t, restClient)
 }
 
 func TestStorageRESTClientStatVol(t *testing.T) {
-	httpServer, restClient, prevGlobalServerConfig, endpointPath := newStorageRESTHTTPServerClient(t)
+	httpServer, restClient, endpointPath := newStorageRESTHTTPServerClient(t)
 	defer httpServer.Close()
-	defer func() {
-		globalServerConfig = prevGlobalServerConfig
-	}()
 	defer os.RemoveAll(endpointPath)
 
 	testStorageAPIStatVol(t, restClient)
 }
 
 func TestStorageRESTClientDeleteVol(t *testing.T) {
-	httpServer, restClient, prevGlobalServerConfig, endpointPath := newStorageRESTHTTPServerClient(t)
+	httpServer, restClient, endpointPath := newStorageRESTHTTPServerClient(t)
 	defer httpServer.Close()
-	defer func() {
-		globalServerConfig = prevGlobalServerConfig
-	}()
 	defer os.RemoveAll(endpointPath)
 
 	testStorageAPIDeleteVol(t, restClient)
 }
 
-func TestStorageRESTClientCheckFile(t *testing.T) {
-	httpServer, restClient, prevGlobalServerConfig, endpointPath := newStorageRESTHTTPServerClient(t)
+func TestStorageRESTClientStatInfoFile(t *testing.T) {
+	httpServer, restClient, endpointPath := newStorageRESTHTTPServerClient(t)
 	defer httpServer.Close()
-	defer func() {
-		globalServerConfig = prevGlobalServerConfig
-	}()
 	defer os.RemoveAll(endpointPath)
 
-	testStorageAPICheckFile(t, restClient)
+	testStorageAPIStatInfoFile(t, restClient)
 }
 
 func TestStorageRESTClientListDir(t *testing.T) {
-	httpServer, restClient, prevGlobalServerConfig, endpointPath := newStorageRESTHTTPServerClient(t)
+	httpServer, restClient, endpointPath := newStorageRESTHTTPServerClient(t)
 	defer httpServer.Close()
-	defer func() {
-		globalServerConfig = prevGlobalServerConfig
-	}()
 	defer os.RemoveAll(endpointPath)
 
 	testStorageAPIListDir(t, restClient)
 }
 
 func TestStorageRESTClientReadAll(t *testing.T) {
-	httpServer, restClient, prevGlobalServerConfig, endpointPath := newStorageRESTHTTPServerClient(t)
+	httpServer, restClient, endpointPath := newStorageRESTHTTPServerClient(t)
 	defer httpServer.Close()
-	defer func() {
-		globalServerConfig = prevGlobalServerConfig
-	}()
 	defer os.RemoveAll(endpointPath)
 
 	testStorageAPIReadAll(t, restClient)
 }
 
 func TestStorageRESTClientReadFile(t *testing.T) {
-	httpServer, restClient, prevGlobalServerConfig, endpointPath := newStorageRESTHTTPServerClient(t)
+	httpServer, restClient, endpointPath := newStorageRESTHTTPServerClient(t)
 	defer httpServer.Close()
-	defer func() {
-		globalServerConfig = prevGlobalServerConfig
-	}()
 	defer os.RemoveAll(endpointPath)
 
 	testStorageAPIReadFile(t, restClient)
 }
 
 func TestStorageRESTClientAppendFile(t *testing.T) {
-	httpServer, restClient, prevGlobalServerConfig, endpointPath := newStorageRESTHTTPServerClient(t)
+	httpServer, restClient, endpointPath := newStorageRESTHTTPServerClient(t)
 	defer httpServer.Close()
-	defer func() {
-		globalServerConfig = prevGlobalServerConfig
-	}()
 	defer os.RemoveAll(endpointPath)
 
 	testStorageAPIAppendFile(t, restClient)
 }
 
 func TestStorageRESTClientDeleteFile(t *testing.T) {
-	httpServer, restClient, prevGlobalServerConfig, endpointPath := newStorageRESTHTTPServerClient(t)
+	httpServer, restClient, endpointPath := newStorageRESTHTTPServerClient(t)
 	defer httpServer.Close()
-	defer func() {
-		globalServerConfig = prevGlobalServerConfig
-	}()
 	defer os.RemoveAll(endpointPath)
 
 	testStorageAPIDeleteFile(t, restClient)
 }
 
 func TestStorageRESTClientRenameFile(t *testing.T) {
-	httpServer, restClient, prevGlobalServerConfig, endpointPath := newStorageRESTHTTPServerClient(t)
+	httpServer, restClient, endpointPath := newStorageRESTHTTPServerClient(t)
 	defer httpServer.Close()
-	defer func() {
-		globalServerConfig = prevGlobalServerConfig
-	}()
 	defer os.RemoveAll(endpointPath)
 
 	testStorageAPIRenameFile(t, restClient)

@@ -57,7 +57,7 @@ type StorageAPI interface {
 
 	// Metadata operations
 	DeleteVersion(ctx context.Context, volume, path string, fi FileInfo, forceDelMarker bool) error
-	DeleteVersions(ctx context.Context, volume string, versions []FileInfo) []error
+	DeleteVersions(ctx context.Context, volume string, versions []FileInfoVersions) []error
 	WriteMetadata(ctx context.Context, volume, path string, fi FileInfo) error
 	UpdateMetadata(ctx context.Context, volume, path string, fi FileInfo) error
 	ReadVersion(ctx context.Context, volume, path, versionID string, readData bool) (FileInfo, error)
@@ -71,9 +71,9 @@ type StorageAPI interface {
 	ReadFileStream(ctx context.Context, volume, path string, offset, length int64) (io.ReadCloser, error)
 	RenameFile(ctx context.Context, srcVolume, srcPath, dstVolume, dstPath string) error
 	CheckParts(ctx context.Context, volume string, path string, fi FileInfo) error
-	CheckFile(ctx context.Context, volume string, path string) (err error)
 	Delete(ctx context.Context, volume string, path string, recursive bool) (err error)
 	VerifyFile(ctx context.Context, volume, path string, fi FileInfo) error
+	StatInfoFile(ctx context.Context, volume, path string, glob bool) (stat []StatInfo, err error)
 
 	// Write all data, syncs the data to disk.
 	// Should be used for smaller payloads.

@@ -218,13 +218,6 @@ func (d *naughtyDisk) CheckParts(ctx context.Context, volume string, path string
 	return d.disk.CheckParts(ctx, volume, path, fi)
 }
 
-func (d *naughtyDisk) CheckFile(ctx context.Context, volume string, path string) (err error) {
-	if err := d.calcError(); err != nil {
-		return err
-	}
-	return d.disk.CheckFile(ctx, volume, path)
-}
-
 func (d *naughtyDisk) Delete(ctx context.Context, volume string, path string, recursive bool) (err error) {
 	if err := d.calcError(); err != nil {
 		return err
@@ -232,7 +225,7 @@ func (d *naughtyDisk) Delete(ctx context.Context, volume string, path string, re
 	return d.disk.Delete(ctx, volume, path, recursive)
 }
 
-func (d *naughtyDisk) DeleteVersions(ctx context.Context, volume string, versions []FileInfo) []error {
+func (d *naughtyDisk) DeleteVersions(ctx context.Context, volume string, versions []FileInfoVersions) []error {
 	if err := d.calcError(); err != nil {
 		errs := make([]error, len(versions))
 		for i := range errs {
@@ -290,4 +283,11 @@ func (d *naughtyDisk) VerifyFile(ctx context.Context, volume, path string, fi Fi
 		return err
 	}
 	return d.disk.VerifyFile(ctx, volume, path, fi)
+}
+
+func (d *naughtyDisk) StatInfoFile(ctx context.Context, volume, path string, glob bool) (stat []StatInfo, err error) {
+	if err := d.calcError(); err != nil {
+		return stat, err
+	}
+	return d.disk.StatInfoFile(ctx, volume, path, glob)
 }

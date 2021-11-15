@@ -52,17 +52,17 @@ import (
 // Streams can be assumed to be sorted in ascending order.
 // If the stream ends before a false boolean it can be assumed it was truncated.
 
-const metacacheStreamVersion = 1
+const metacacheStreamVersion = 2
 
 // metacacheWriter provides a serializer of metacache objects.
 type metacacheWriter struct {
-	mw        *msgp.Writer
-	creator   func() error
-	closer    func() error
-	blockSize int
-
-	streamErr error
-	streamWg  sync.WaitGroup
+	streamErr   error
+	mw          *msgp.Writer
+	creator     func() error
+	closer      func() error
+	blockSize   int
+	streamWg    sync.WaitGroup
+	reuseBlocks bool
 }
 
 // newMetacacheWriter will create a serializer that will write objects in given order to the output.
@@ -140,6 +140,9 @@ func (w *metacacheWriter) write(objs ...metaCacheEntry) error {
 		err = w.mw.WriteBytes(o.metadata)
 		if err != nil {
 			return err
+		}
+		if w.reuseBlocks || o.reusable {
+			metaDataPoolPut(o.metadata)
 		}
 	}
 
@@ -262,7 +265,7 @@ func newMetacacheReader(r io.Reader) *metacacheReader {
 				return err
 			}
 			switch v {
-			case metacacheStreamVersion:
+			case 1, 2:
 			default:
 				return fmt.Errorf("metacacheReader: Unknown version: %d", v)
 			}
@@ -354,9 +357,13 @@ func (r *metacacheReader) next() (metaCacheEntry, error) {
 		r.err = err
 		return m, err
 	}
-	m.metadata, err = r.mr.ReadBytes(nil)
+	m.metadata, err = r.mr.ReadBytes(metaDataPoolGet())
 	if err == io.EOF {
 		err = io.ErrUnexpectedEOF
+	}
+	if len(m.metadata) == 0 && cap(m.metadata) >= metaDataReadDefault {
+		metaDataPoolPut(m.metadata)
+		m.metadata = nil
 	}
 	r.err = err
 	return m, err
@@ -510,12 +517,16 @@ func (r *metacacheReader) readN(n int, inclDeleted, inclDirs bool, prefix string
 			r.mr.R.Skip(1)
 			return metaCacheEntriesSorted{o: res}, io.EOF
 		}
-		if meta.metadata, err = r.mr.ReadBytes(nil); err != nil {
+		if meta.metadata, err = r.mr.ReadBytes(metaDataPoolGet()); err != nil {
 			if err == io.EOF {
 				err = io.ErrUnexpectedEOF
 			}
 			r.err = err
 			return metaCacheEntriesSorted{o: res}, err
+		}
+		if len(meta.metadata) == 0 {
+			metaDataPoolPut(meta.metadata)
+			meta.metadata = nil
 		}
 		if !inclDirs && meta.isDir() {
 			continue
@@ -565,12 +576,16 @@ func (r *metacacheReader) readAll(ctx context.Context, dst chan<- metaCacheEntry
 			r.err = err
 			return err
 		}
-		if meta.metadata, err = r.mr.ReadBytes(nil); err != nil {
+		if meta.metadata, err = r.mr.ReadBytes(metaDataPoolGet()); err != nil {
 			if err == io.EOF {
 				err = io.ErrUnexpectedEOF
 			}
 			r.err = err
 			return err
+		}
+		if len(meta.metadata) == 0 {
+			metaDataPoolPut(meta.metadata)
+			meta.metadata = nil
 		}
 		select {
 		case <-ctx.Done():

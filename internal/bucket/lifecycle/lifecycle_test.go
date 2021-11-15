@@ -21,8 +21,14 @@ import (
 	"bytes"
 	"encoding/xml"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
+	xhttp "github.com/minio/minio/internal/http"
 )
 
 func TestParseAndValidateLifecycleConfig(t *testing.T) {
@@ -99,6 +105,12 @@ func TestParseAndValidateLifecycleConfig(t *testing.T) {
 			expectedParsingErr:    nil,
 			expectedValidationErr: nil,
 		},
+		// Lifecycle with zero Transition Days
+		{
+			inputConfig:           `<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ID>rule</ID><Filter></Filter><Status>Enabled</Status><Transition><Days>0</Days><StorageClass>S3TIER-1</StorageClass></Transition></Rule></LifecycleConfiguration>`,
+			expectedParsingErr:    nil,
+			expectedValidationErr: nil,
+		},
 	}
 
 	for i, tc := range testCases {
@@ -114,7 +126,7 @@ func TestParseAndValidateLifecycleConfig(t *testing.T) {
 			}
 			err = lc.Validate()
 			if err != tc.expectedValidationErr {
-				t.Fatalf("%d: Expected %v during parsing but got %v", i+1, tc.expectedValidationErr, err)
+				t.Fatalf("%d: Expected %v during validation but got %v", i+1, tc.expectedValidationErr, err)
 			}
 		})
 	}
@@ -141,7 +153,7 @@ func TestMarshalLifecycleConfig(t *testing.T) {
 				Status:                      "Enabled",
 				Filter:                      Filter{Prefix: Prefix{string: "prefix-1", set: true}},
 				Expiration:                  Expiration{Date: midnightTS},
-				NoncurrentVersionTransition: NoncurrentVersionTransition{NoncurrentDays: 2, StorageClass: "TEST"},
+				NoncurrentVersionTransition: NoncurrentVersionTransition{NoncurrentDays: TransitionDays(2), StorageClass: "TEST"},
 			},
 		},
 	}
@@ -205,11 +217,15 @@ func TestExpectedExpiryTime(t *testing.T) {
 
 func TestComputeActions(t *testing.T) {
 	testCases := []struct {
-		inputConfig    string
-		objectName     string
-		objectTags     string
-		objectModTime  time.Time
-		expectedAction Action
+		inputConfig            string
+		objectName             string
+		objectTags             string
+		objectModTime          time.Time
+		isExpiredDelMarker     bool
+		expectedAction         Action
+		isNoncurrent           bool
+		objectSuccessorModTime time.Time
+		versionID              string
 	}{
 		// Empty object name (unexpected case) should always return NoneAction
 		{
@@ -350,6 +366,47 @@ func TestComputeActions(t *testing.T) {
 			objectModTime:  time.Now().UTC().Add(-24 * time.Hour), // Created 1 day ago
 			expectedAction: DeleteAction,
 		},
+		// Should delete expired delete marker right away
+		{
+			inputConfig:        `<BucketLifecycleConfiguration><Rule><Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration><Filter></Filter><Status>Enabled</Status></Rule></BucketLifecycleConfiguration>`,
+			objectName:         "foodir/fooobject",
+			objectModTime:      time.Now().UTC().Add(-1 * time.Hour), // Created one hour ago
+			isExpiredDelMarker: true,
+			expectedAction:     DeleteVersionAction,
+		},
+		// Should not delete expired marker if its time has not come yet
+		{
+			inputConfig:        `<BucketLifecycleConfiguration><Rule><Filter></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></BucketLifecycleConfiguration>`,
+			objectName:         "foodir/fooobject",
+			objectModTime:      time.Now().UTC().Add(-12 * time.Hour), // Created 12 hours ago
+			isExpiredDelMarker: true,
+			expectedAction:     NoneAction,
+		},
+		// Should delete expired marker since its time has come
+		{
+			inputConfig:        `<BucketLifecycleConfiguration><Rule><Filter></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></BucketLifecycleConfiguration>`,
+			objectName:         "foodir/fooobject",
+			objectModTime:      time.Now().UTC().Add(-10 * 24 * time.Hour), // Created 10 days ago
+			isExpiredDelMarker: true,
+			expectedAction:     DeleteVersionAction,
+		},
+		// Should transition immediately when Transition days is zero
+		{
+			inputConfig:    `<BucketLifecycleConfiguration><Rule><Filter></Filter><Status>Enabled</Status><Transition><Days>0</Days><StorageClass>S3TIER-1</StorageClass></Transition></Rule></BucketLifecycleConfiguration>`,
+			objectName:     "foodir/fooobject",
+			objectModTime:  time.Now().Add(-1 * time.Nanosecond).UTC(), // Created now
+			expectedAction: TransitionAction,
+		},
+		// Should transition immediately when NoncurrentVersion Transition days is zero
+		{
+			inputConfig:            `<BucketLifecycleConfiguration><Rule><Filter></Filter><Status>Enabled</Status><NoncurrentVersionTransition><NoncurrentDays>0</NoncurrentDays><StorageClass>S3TIER-1</StorageClass></NoncurrentVersionTransition></Rule></BucketLifecycleConfiguration>`,
+			objectName:             "foodir/fooobject",
+			objectModTime:          time.Now().Add(-1 * time.Nanosecond).UTC(), // Created now
+			expectedAction:         TransitionVersionAction,
+			isNoncurrent:           true,
+			objectSuccessorModTime: time.Now().Add(-1 * time.Nanosecond).UTC(),
+			versionID:              uuid.New().String(),
+		},
 	}
 
 	for _, tc := range testCases {
@@ -360,10 +417,14 @@ func TestComputeActions(t *testing.T) {
 				t.Fatalf("Got unexpected error: %v", err)
 			}
 			if resultAction := lc.ComputeAction(ObjectOpts{
-				Name:     tc.objectName,
-				UserTags: tc.objectTags,
-				ModTime:  tc.objectModTime,
-				IsLatest: true,
+				Name:             tc.objectName,
+				UserTags:         tc.objectTags,
+				ModTime:          tc.objectModTime,
+				DeleteMarker:     tc.isExpiredDelMarker,
+				NumVersions:      1,
+				IsLatest:         !tc.isNoncurrent,
+				SuccessorModTime: tc.objectSuccessorModTime,
+				VersionID:        tc.versionID,
 			}); resultAction != tc.expectedAction {
 				t.Fatalf("Expected action: `%v`, got: `%v`", tc.expectedAction, resultAction)
 			}
@@ -409,6 +470,16 @@ func TestHasActiveRules(t *testing.T) {
 			prefix:         "foodir/foobject",
 			expectedNonRec: false, expectedRec: false,
 		},
+		{
+			inputConfig:    `<LifecycleConfiguration><Rule><Status>Enabled</Status><Transition><StorageClass>S3TIER-1</StorageClass></Transition></Rule></LifecycleConfiguration>`,
+			prefix:         "foodir/foobject/foo.txt",
+			expectedNonRec: true, expectedRec: true,
+		},
+		{
+			inputConfig:    `<LifecycleConfiguration><Rule><Status>Enabled</Status><NoncurrentVersionTransition><StorageClass>S3TIER-1</StorageClass></NoncurrentVersionTransition></Rule></LifecycleConfiguration>`,
+			prefix:         "foodir/foobject/foo.txt",
+			expectedNonRec: true, expectedRec: true,
+		},
 	}
 
 	for i, tc := range testCases {
@@ -427,5 +498,124 @@ func TestHasActiveRules(t *testing.T) {
 
 		})
 
+	}
+}
+
+func TestSetPredictionHeaders(t *testing.T) {
+	lc := Lifecycle{
+		Rules: []Rule{
+			{
+				ID:     "rule-1",
+				Status: "Enabled",
+				Expiration: Expiration{
+					Days: ExpirationDays(3),
+					set:  true,
+				},
+			},
+			{
+				ID:     "rule-2",
+				Status: "Enabled",
+				Transition: Transition{
+					Days:         TransitionDays(3),
+					StorageClass: "TIER-1",
+					set:          true,
+				},
+			},
+			{
+				ID:     "rule-3",
+				Status: "Enabled",
+				NoncurrentVersionTransition: NoncurrentVersionTransition{
+					NoncurrentDays: TransitionDays(5),
+					StorageClass:   "TIER-2",
+					set:            true,
+				},
+			},
+		},
+	}
+
+	// current version
+	obj1 := ObjectOpts{
+		Name:     "obj1",
+		IsLatest: true,
+	}
+	// non-current version
+	obj2 := ObjectOpts{
+		Name: "obj2",
+	}
+
+	tests := []struct {
+		obj         ObjectOpts
+		expRuleID   int
+		transRuleID int
+	}{
+		{
+			obj:         obj1,
+			expRuleID:   0,
+			transRuleID: 1,
+		},
+		{
+			obj:         obj2,
+			expRuleID:   0,
+			transRuleID: 2,
+		},
+	}
+	for i, tc := range tests {
+		w := httptest.NewRecorder()
+		lc.SetPredictionHeaders(w, tc.obj)
+		if expHdrs, ok := w.Header()[xhttp.AmzExpiration]; ok && !strings.Contains(expHdrs[0], lc.Rules[tc.expRuleID].ID) {
+			t.Fatalf("Test %d: Expected %s header", i+1, xhttp.AmzExpiration)
+		}
+		if transHdrs, ok := w.Header()[xhttp.MinIOTransition]; ok {
+			if !strings.Contains(transHdrs[0], lc.Rules[tc.transRuleID].ID) {
+				t.Fatalf("Test %d: Expected %s header", i+1, xhttp.MinIOTransition)
+			}
+
+			if tc.obj.IsLatest {
+				if expectedDue, _ := lc.Rules[tc.transRuleID].Transition.NextDue(tc.obj); !strings.Contains(transHdrs[0], expectedDue.Format(http.TimeFormat)) {
+					t.Fatalf("Test %d: Expected transition time %s", i+1, expectedDue)
+				}
+			} else {
+				if expectedDue, _ := lc.Rules[tc.transRuleID].NoncurrentVersionTransition.NextDue(tc.obj); !strings.Contains(transHdrs[0], expectedDue.Format(http.TimeFormat)) {
+					t.Fatalf("Test %d: Expected transition time %s", i+1, expectedDue)
+				}
+			}
+		}
+	}
+}
+
+func TestTransitionTier(t *testing.T) {
+	lc := Lifecycle{
+		Rules: []Rule{
+			{
+				ID:     "rule-1",
+				Status: "Enabled",
+				Transition: Transition{
+					Days:         TransitionDays(3),
+					StorageClass: "TIER-1",
+				},
+			},
+			{
+				ID:     "rule-2",
+				Status: "Enabled",
+				NoncurrentVersionTransition: NoncurrentVersionTransition{
+					NoncurrentDays: TransitionDays(3),
+					StorageClass:   "TIER-2",
+				},
+			},
+		},
+	}
+
+	obj1 := ObjectOpts{
+		Name:     "obj1",
+		IsLatest: true,
+	}
+	obj2 := ObjectOpts{
+		Name: "obj2",
+	}
+	if got := lc.TransitionTier(obj1); got != "TIER-1" {
+		t.Fatalf("Expected TIER-1 but got %s", got)
+	}
+	if got := lc.TransitionTier(obj2); got != "TIER-2" {
+		t.Fatalf("Expected TIER-2 but got %s", got)
 	}
 }

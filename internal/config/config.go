@@ -58,6 +58,7 @@ const (
 	RegionName = "name"
 	AccessKey  = "access_key"
 	SecretKey  = "secret_key"
+	License    = "license"
 )
 
 // Top level config constants.
@@ -66,18 +67,20 @@ const (
 	PolicyOPASubSys      = "policy_opa"
 	IdentityOpenIDSubSys = "identity_openid"
 	IdentityLDAPSubSys   = "identity_ldap"
+	IdentityTLSSubSys    = "identity_tls"
 	CacheSubSys          = "cache"
 	RegionSubSys         = "region"
 	EtcdSubSys           = "etcd"
 	StorageClassSubSys   = "storage_class"
 	APISubSys            = "api"
 	CompressionSubSys    = "compression"
-	KmsKesSubSys         = "kms_kes"
 	LoggerWebhookSubSys  = "logger_webhook"
 	AuditWebhookSubSys   = "audit_webhook"
+	AuditKafkaSubSys     = "audit_kafka"
 	HealSubSys           = "heal"
 	ScannerSubSys        = "scanner"
 	CrawlerSubSys        = "crawler"
+	SubnetSubSys         = "subnet"
 
 	// Add new constants here if you add new fields to config.
 )
@@ -107,12 +110,13 @@ var SubSystems = set.CreateStringSet(
 	APISubSys,
 	StorageClassSubSys,
 	CompressionSubSys,
-	KmsKesSubSys,
 	LoggerWebhookSubSys,
 	AuditWebhookSubSys,
+	AuditKafkaSubSys,
 	PolicyOPASubSys,
 	IdentityLDAPSubSys,
 	IdentityOpenIDSubSys,
+	IdentityTLSSubSys,
 	ScannerSubSys,
 	HealSubSys,
 	NotifyAMQPSubSys,
@@ -125,6 +129,7 @@ var SubSystems = set.CreateStringSet(
 	NotifyPostgresSubSys,
 	NotifyRedisSubSys,
 	NotifyWebhookSubSys,
+	SubnetSubSys,
 )
 
 // SubSystemsDynamic - all sub-systems that have dynamic config.
@@ -133,6 +138,7 @@ var SubSystemsDynamic = set.CreateStringSet(
 	CompressionSubSys,
 	ScannerSubSys,
 	HealSubSys,
+	SubnetSubSys,
 )
 
 // SubSystemsSingleTargets - subsystems which only support single target.
@@ -144,10 +150,10 @@ var SubSystemsSingleTargets = set.CreateStringSet([]string{
 	APISubSys,
 	StorageClassSubSys,
 	CompressionSubSys,
-	KmsKesSubSys,
 	PolicyOPASubSys,
 	IdentityLDAPSubSys,
 	IdentityOpenIDSubSys,
+	IdentityTLSSubSys,
 	HealSubSys,
 	ScannerSubSys,
 }...)
@@ -211,6 +217,20 @@ func (kvs KVS) Empty() bool {
 	return len(kvs) == 0
 }
 
+// Clone - returns a copy of the KVS
+func (kvs KVS) Clone() KVS {
+	return append(make(KVS, 0, len(kvs)), kvs...)
+}
+
+// GetWithDefault - returns default value if key not set
+func (kvs KVS) GetWithDefault(key string, defaultKVS KVS) string {
+	v := kvs.Get(key)
+	if len(v) == 0 {
+		return defaultKVS.Get(key)
+	}
+	return v
+}
+
 // Keys returns the list of keys for the current KVS
 func (kvs KVS) Keys() []string {
 	var keys = make([]string, len(kvs))
@@ -248,6 +268,23 @@ func (kvs KVS) String() string {
 		s.WriteString(KvSpaceSeparator)
 	}
 	return s.String()
+}
+
+// Merge environment values with on disk KVS, environment values overrides
+// anything on the disk.
+func Merge(cfgKVS map[string]KVS, envname string, defaultKVS KVS) map[string]KVS {
+	newCfgKVS := make(map[string]KVS)
+	for _, e := range env.List(envname) {
+		tgt := strings.TrimPrefix(e, envname+Default)
+		if tgt == envname {
+			tgt = Default
+		}
+		newCfgKVS[tgt] = defaultKVS
+	}
+	for tgt, kv := range cfgKVS {
+		newCfgKVS[tgt] = kv
+	}
+	return newCfgKVS
 }
 
 // Set sets a value, if not sets a default value.
@@ -358,8 +395,10 @@ func (c Config) RedactSensitiveInfo() Config {
 				}
 			}
 		}
-		nc[configName] = configVals
 	}
+
+	// Remove the server credentials altogether
+	nc.DelKVS(CredentialsSubSys)
 
 	return nc
 }
@@ -506,7 +545,6 @@ func (c Config) Merge() Config {
 				rnSubSys, ok := renamedSubsys[subSys]
 				if !ok {
 					// A config subsystem was removed or server was downgraded.
-					Logger.Info("config: ignoring unknown subsystem config %q\n", subSys)
 					continue
 				}
 				// Copy over settings from previous sub-system
@@ -735,10 +773,12 @@ func (c Config) SetKVS(s string, defaultKVS map[string]KVS) (dynamic bool, err e
 		kvs.Set(Enable, EnableOn)
 	}
 
-	currKVS, ok := c[subSys][tgt]
+	var currKVS KVS
+	ck, ok := c[subSys][tgt]
 	if !ok {
-		currKVS = defaultKVS[subSys]
+		currKVS = defaultKVS[subSys].Clone()
 	} else {
+		currKVS = ck.Clone()
 		for _, kv := range defaultKVS[subSys] {
 			if _, ok = currKVS.Lookup(kv.Key); !ok {
 				currKVS.Set(kv.Key, kv.Value)

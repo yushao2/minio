@@ -22,12 +22,12 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	xnet "github.com/minio/minio/internal/net"
+	xnet "github.com/minio/pkg/net"
 )
 
 type errorValidator struct{}
 
-func (e errorValidator) Validate(token, dsecs string) (map[string]interface{}, error) {
+func (e errorValidator) Validate(idToken, accessToken, dsecs string) (map[string]interface{}, error) {
 	return nil, ErrTokenExpired
 }
 
@@ -79,7 +79,7 @@ func TestValidators(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err = v.Validate("", ""); err != ErrTokenExpired {
+	if _, err = v.Validate("", "", ""); err != ErrTokenExpired {
 		t.Fatalf("Expected error %s, got %s", ErrTokenExpired, err)
 	}
 
@@ -95,7 +95,7 @@ func TestValidators(t *testing.T) {
 
 	cfg := Config{}
 	cfg.JWKS.URL = u
-	if err = vrs.Add(NewJWT(cfg)); err != nil {
+	if err = vrs.Add(&cfg); err != nil {
 		t.Fatal(err)
 	}
 

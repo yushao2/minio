@@ -25,10 +25,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/minio/console/restapi"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/bucket/bandwidth"
 	"github.com/minio/minio/internal/handlers"
 	"github.com/minio/minio/internal/kms"
+	"github.com/rs/dnscache"
 
 	"github.com/dustin/go-humanize"
 	"github.com/minio/minio/internal/auth"
@@ -37,14 +39,17 @@ import (
 	"github.com/minio/minio/internal/config/dns"
 	xldap "github.com/minio/minio/internal/config/identity/ldap"
 	"github.com/minio/minio/internal/config/identity/openid"
+	xtls "github.com/minio/minio/internal/config/identity/tls"
 	"github.com/minio/minio/internal/config/policy/opa"
 	"github.com/minio/minio/internal/config/storageclass"
+	"github.com/minio/minio/internal/config/subnet"
 	xhttp "github.com/minio/minio/internal/http"
 	etcd "go.etcd.io/etcd/client/v3"
 
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/pubsub"
 	"github.com/minio/pkg/certs"
+	xnet "github.com/minio/pkg/net"
 )
 
 // minio configuration related constants.
@@ -87,14 +92,12 @@ const (
 	// date and server date during signature verification.
 	globalMaxSkewTime = 15 * time.Minute // 15 minutes skew allowed.
 
-	// GlobalStaleUploadsExpiry - Expiry duration after which the uploads in multipart, tmp directory are deemed stale.
+	// GlobalStaleUploadsExpiry - Expiry duration after which the uploads in multipart,
+	// tmp directory are deemed stale.
 	GlobalStaleUploadsExpiry = time.Hour * 24 // 24 hrs.
 
 	// GlobalStaleUploadsCleanupInterval - Cleanup interval when the stale uploads cleanup is initiated.
-	GlobalStaleUploadsCleanupInterval = time.Hour * 12 // 12 hrs.
-
-	// GlobalServiceExecutionInterval - Executes the Lifecycle events.
-	GlobalServiceExecutionInterval = time.Hour * 24 // 24 hrs.
+	GlobalStaleUploadsCleanupInterval = time.Hour * 6 // 6 hrs.
 
 	// Refresh interval to update in-memory iam config cache.
 	globalRefreshIAMInterval = 5 * time.Minute
@@ -106,7 +109,7 @@ const (
 	maxBucketSSEConfigSize = 1 * humanize.MiByte
 
 	// diskFillFraction is the fraction of a disk we allow to be filled.
-	diskFillFraction = 0.95
+	diskFillFraction = 0.99
 
 	// diskAssumeUnknownSize is the size to assume when an unknown size upload is requested.
 	diskAssumeUnknownSize = 1 << 30
@@ -118,7 +121,6 @@ const (
 var globalCLIContext = struct {
 	JSON, Quiet    bool
 	Anonymous      bool
-	Addr           string
 	StrictS3Compat bool
 }{}
 
@@ -138,6 +140,10 @@ var (
 	// This flag is set to 'true' by default
 	globalBrowserEnabled = true
 
+	// Custom browser redirect URL, not set by default
+	// and it is automatically deduced.
+	globalBrowserRedirectURL *xnet.URL
+
 	// This flag is set to 'true' when MINIO_UPDATE env is set to 'off'. Default is false.
 	globalInplaceUpdateDisabled = false
 
@@ -146,10 +152,17 @@ var (
 
 	// MinIO local server address (in `host:port` format)
 	globalMinioAddr = ""
+
 	// MinIO default port, can be changed through command line.
-	globalMinioPort = GlobalMinioDefaultPort
+	globalMinioPort            = GlobalMinioDefaultPort
+	globalMinioConsolePort     = "13333"
+	globalMinioConsolePortAuto = false
+
 	// Holds the host that was passed using --address
 	globalMinioHost = ""
+	// Holds the host that was passed using --console-address
+	globalMinioConsoleHost = ""
+
 	// Holds the possible host endpoint.
 	globalMinioEndpoint = ""
 
@@ -176,6 +189,7 @@ var (
 	globalStorageClass storageclass.Config
 	globalLDAPConfig   xldap.Config
 	globalOpenIDConfig openid.Config
+	globalSTSTLSConfig xtls.Config
 
 	// CA root certificates, a nil value means system certs pool will be used
 	globalRootCAs *x509.CertPool
@@ -204,6 +218,9 @@ var (
 
 	// The name of this local node, fetched from arguments
 	globalLocalNodeName string
+
+	// The global subnet config
+	globalSubnetConfig subnet.Config
 
 	globalRemoteEndpoints map[string]Endpoint
 
@@ -238,6 +255,9 @@ var (
 
 	// Allocated etcd endpoint for config and bucket DNS.
 	globalEtcdClient *etcd.Client
+
+	// Cluster replication manager.
+	globalSiteReplicationSys SiteReplicationSys
 
 	// Is set to true when Bucket federation is requested
 	// and is 'true' when etcdConfig.PathPrefix is empty
@@ -282,6 +302,8 @@ var (
 	globalBackgroundHealRoutine *healRoutine
 	globalBackgroundHealState   *allHealState
 
+	globalMRFState mrfState
+
 	// If writes to FS backend should be O_SYNC.
 	globalFSOSync bool
 
@@ -291,7 +313,9 @@ var (
 
 	globalProxyTransport http.RoundTripper
 
-	globalDNSCache *xhttp.DNSCache
+	globalDNSCache = &dnscache.Resolver{
+		Timeout: 5 * time.Second,
+	}
 
 	globalForwarder *handlers.Forwarder
 
@@ -299,21 +323,9 @@ var (
 
 	globalTierJournal *tierJournal
 
-	globalDebugRemoteTiersImmediately []string
+	globalConsoleSrv *restapi.Server
+
 	// Add new variable global values here.
 )
 
 var errSelfTestFailure = errors.New("self test failed. unsafe to start server")
-
-// Returns minio global information, as a key value map.
-// returned list of global values is not an exhaustive
-// list. Feel free to add new relevant fields.
-func getGlobalInfo() (globalInfo map[string]interface{}) {
-	globalInfo = map[string]interface{}{
-		"serverRegion": globalServerRegion,
-		"domains":      globalDomainNames,
-		// Add more relevant global settings here.
-	}
-
-	return globalInfo
-}

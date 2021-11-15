@@ -32,25 +32,34 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/fatih/color"
+	fcolor "github.com/fatih/color"
+	"github.com/go-openapi/loads"
+	"github.com/inconshreveable/mousetrap"
 	dns2 "github.com/miekg/dns"
 	"github.com/minio/cli"
+	consoleCerts "github.com/minio/console/pkg/certs"
+	"github.com/minio/console/restapi"
+	"github.com/minio/console/restapi/operations"
 	"github.com/minio/kes"
+	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/auth"
+	"github.com/minio/minio/internal/color"
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/handlers"
-	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/kms"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/certs"
 	"github.com/minio/pkg/console"
 	"github.com/minio/pkg/ellipses"
 	"github.com/minio/pkg/env"
+	xnet "github.com/minio/pkg/net"
+	"github.com/rs/dnscache"
 )
 
 // serverDebugLog will enable debug printing
@@ -58,25 +67,49 @@ var serverDebugLog = env.Get("_MINIO_SERVER_DEBUG", config.EnableOff) == config.
 var defaultAWSCredProvider []credentials.Provider
 
 func init() {
+	if runtime.GOOS == "windows" {
+		if mousetrap.StartedByExplorer() {
+			fmt.Printf("Don't double-click %s\n", os.Args[0])
+			fmt.Println("You need to open cmd.exe/PowerShell and run it from the command line")
+			fmt.Println("Refer to the docs here on how to run it as a Windows Service https://github.com/minio/minio-service/tree/master/windows")
+			fmt.Println("Press the Enter Key to Exit")
+			fmt.Scanln()
+			os.Exit(1)
+		}
+	}
+
 	rand.Seed(time.Now().UTC().UnixNano())
 
 	logger.Init(GOPATH, GOROOT)
 	logger.RegisterError(config.FmtError)
 
-	// Inject into config package.
-	config.Logger.Info = logger.Info
-	config.Logger.LogIf = logger.LogIf
-
-	if IsKubernetes() || IsDocker() || IsBOSH() || IsDCOS() || IsKubernetesReplicaSet() || IsPCFTile() {
-		// 30 seconds matches the orchestrator DNS TTLs, have
-		// a 5 second timeout to lookup from DNS servers.
-		globalDNSCache = xhttp.NewDNSCache(30*time.Second, 5*time.Second, logger.LogOnceIf)
-	} else {
-		// On bare-metals DNS do not change often, so it is
-		// safe to assume a higher timeout upto 10 minutes.
-		globalDNSCache = xhttp.NewDNSCache(10*time.Minute, 5*time.Second, logger.LogOnceIf)
-	}
 	initGlobalContext()
+
+	options := dnscache.ResolverRefreshOptions{
+		ClearUnused:      true,
+		PersistOnFailure: false,
+	}
+
+	// Call to refresh will refresh names in cache. If you pass true, it will also
+	// remove cached names not looked up since the last call to Refresh. It is a good idea
+	// to call this method on a regular interval.
+	go func() {
+		var t *time.Ticker
+		if IsKubernetes() || IsDocker() || IsBOSH() || IsDCOS() || IsPCFTile() {
+			t = time.NewTicker(1 * time.Minute)
+		} else {
+			t = time.NewTicker(10 * time.Minute)
+		}
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				globalDNSCache.RefreshWithOptions(options)
+			case <-GlobalContext.Done():
+				return
+			}
+		}
+	}()
 
 	globalForwarder = handlers.NewForwarder(&handlers.Forwarder{
 		PassHost:     true,
@@ -88,9 +121,7 @@ func init() {
 		},
 	})
 
-	globalTransitionState = newTransitionState()
-
-	console.SetColor("Debug", color.New())
+	console.SetColor("Debug", fcolor.New())
 
 	gob.Register(StorageErr(""))
 
@@ -101,14 +132,122 @@ func init() {
 			},
 		},
 	}
+
+	// All minio-go API operations shall be performed only once,
+	// another way to look at this is we are turning off retries.
+	minio.MaxRetry = 1
+}
+
+const consolePrefix = "CONSOLE_"
+
+func minioConfigToConsoleFeatures() {
+	os.Setenv("CONSOLE_PBKDF_SALT", globalDeploymentID)
+	os.Setenv("CONSOLE_PBKDF_PASSPHRASE", globalDeploymentID)
+	if globalMinioEndpoint != "" {
+		os.Setenv("CONSOLE_MINIO_SERVER", globalMinioEndpoint)
+	} else {
+		os.Setenv("CONSOLE_MINIO_SERVER", getAPIEndpoints()[0])
+	}
+	if value := env.Get("MINIO_LOG_QUERY_URL", ""); value != "" {
+		os.Setenv("CONSOLE_LOG_QUERY_URL", value)
+		if value := env.Get("MINIO_LOG_QUERY_AUTH_TOKEN", ""); value != "" {
+			os.Setenv("CONSOLE_LOG_QUERY_AUTH_TOKEN", value)
+		}
+	}
+	// Enable if prometheus URL is set.
+	if value := env.Get("MINIO_PROMETHEUS_URL", ""); value != "" {
+		os.Setenv("CONSOLE_PROMETHEUS_URL", value)
+		if value := env.Get("MINIO_PROMETHEUS_JOB_ID", "minio-job"); value != "" {
+			os.Setenv("CONSOLE_PROMETHEUS_JOB_ID", value)
+		}
+	}
+	// Enable if LDAP is enabled.
+	if globalLDAPConfig.Enabled {
+		os.Setenv("CONSOLE_LDAP_ENABLED", config.EnableOn)
+	}
+	// if IDP is enabled, set IDP environment variables
+	if globalOpenIDConfig.URL != nil {
+		os.Setenv("CONSOLE_IDP_URL", globalOpenIDConfig.URL.String())
+		os.Setenv("CONSOLE_IDP_CLIENT_ID", globalOpenIDConfig.ClientID)
+		os.Setenv("CONSOLE_IDP_SECRET", globalOpenIDConfig.ClientSecret)
+		os.Setenv("CONSOLE_IDP_HMAC_SALT", globalDeploymentID)
+		os.Setenv("CONSOLE_IDP_HMAC_PASSPHRASE", globalOpenIDConfig.ClientID)
+		os.Setenv("CONSOLE_IDP_SCOPES", strings.Join(globalOpenIDConfig.DiscoveryDoc.ScopesSupported, ","))
+		if globalOpenIDConfig.ClaimUserinfo {
+			os.Setenv("CONSOLE_IDP_USERINFO", "on")
+		}
+		if globalOpenIDConfig.RedirectURI != "" {
+			os.Setenv("CONSOLE_IDP_CALLBACK", globalOpenIDConfig.RedirectURI)
+		} else {
+			os.Setenv("CONSOLE_IDP_CALLBACK", getConsoleEndpoints()[0]+"/oauth_callback")
+		}
+	}
+	os.Setenv("CONSOLE_MINIO_REGION", globalServerRegion)
+	os.Setenv("CONSOLE_CERT_PASSWD", env.Get("MINIO_CERT_PASSWD", ""))
+	if globalSubnetConfig.License != "" {
+		os.Setenv("CONSOLE_SUBNET_LICENSE", globalSubnetConfig.License)
+	}
+}
+
+func initConsoleServer() (*restapi.Server, error) {
+	// unset all console_ environment variables.
+	for _, cenv := range env.List(consolePrefix) {
+		os.Unsetenv(cenv)
+	}
+
+	// enable all console environment variables
+	minioConfigToConsoleFeatures()
+
+	// set certs dir to minio directory
+	consoleCerts.GlobalCertsDir = &consoleCerts.ConfigDir{
+		Path: globalCertsDir.Get(),
+	}
+	consoleCerts.GlobalCertsCADir = &consoleCerts.ConfigDir{
+		Path: globalCertsCADir.Get(),
+	}
+
+	swaggerSpec, err := loads.Embedded(restapi.SwaggerJSON, restapi.FlatSwaggerJSON)
+	if err != nil {
+		return nil, err
+	}
+
+	api := operations.NewConsoleAPI(swaggerSpec)
+
+	if !serverDebugLog {
+		// Disable console logging if server debug log is not enabled
+		noLog := func(string, ...interface{}) {}
+
+		restapi.LogInfo = noLog
+		restapi.LogError = noLog
+		api.Logger = noLog
+	}
+
+	server := restapi.NewServer(api)
+	// register all APIs
+	server.ConfigureAPI()
+
+	restapi.GlobalRootCAs, restapi.GlobalPublicCerts, restapi.GlobalTLSCertsManager = globalRootCAs, globalPublicCerts, globalTLSCerts
+
+	consolePort, _ := strconv.Atoi(globalMinioConsolePort)
+
+	server.Host = globalMinioConsoleHost
+	server.Port = consolePort
+	restapi.Port = globalMinioConsolePort
+	restapi.Hostname = globalMinioConsoleHost
+
+	if globalIsTLS {
+		// If TLS certificates are provided enforce the HTTPS.
+		server.EnabledListeners = []string{"https"}
+		server.TLSPort = consolePort
+		// Need to store tls-port, tls-host un config variables so secure.middleware can read from there
+		restapi.TLSPort = globalMinioConsolePort
+		restapi.Hostname = globalMinioConsoleHost
+	}
+
+	return server, nil
 }
 
 func verifyObjectLayerFeatures(name string, objAPI ObjectLayer) {
-	if (GlobalKMS != nil) && !objAPI.IsEncryptionSupported() {
-		logger.Fatal(errInvalidArgument,
-			"Encryption support is requested but '%s' does not support encryption", name)
-	}
-
 	if strings.HasPrefix(name, "gateway") {
 		if GlobalGatewaySSE.IsSet() && GlobalKMS == nil {
 			uiErr := config.ErrInvalidGWSSEEnvValue(nil).Msg("MINIO_GATEWAY_SSE set but KMS is not configured")
@@ -225,10 +364,42 @@ func handleCommonCmdArgs(ctx *cli.Context) {
 	}
 
 	// Fetch address option
-	globalCLIContext.Addr = ctx.GlobalString("address")
-	if globalCLIContext.Addr == "" || globalCLIContext.Addr == ":"+GlobalMinioDefaultPort {
-		globalCLIContext.Addr = ctx.String("address")
+	addr := ctx.GlobalString("address")
+	if addr == "" || addr == ":"+GlobalMinioDefaultPort {
+		addr = ctx.String("address")
 	}
+
+	// Fetch console address option
+	consoleAddr := ctx.GlobalString("console-address")
+	if consoleAddr == "" {
+		consoleAddr = ctx.String("console-address")
+	}
+
+	if consoleAddr == "" {
+		p, err := xnet.GetFreePort()
+		if err != nil {
+			logger.FatalIf(err, "Unable to get free port for console on the host")
+		}
+		globalMinioConsolePortAuto = true
+		consoleAddr = net.JoinHostPort("", p.String())
+	}
+
+	if _, _, err := net.SplitHostPort(consoleAddr); err != nil {
+		logger.FatalIf(err, "Unable to start listening on console port")
+	}
+
+	if consoleAddr == addr {
+		logger.FatalIf(errors.New("--console-address cannot be same as --address"), "Unable to start the server")
+	}
+
+	globalMinioHost, globalMinioPort = mustSplitHostPort(addr)
+	globalMinioConsoleHost, globalMinioConsolePort = mustSplitHostPort(consoleAddr)
+
+	if globalMinioPort == globalMinioConsolePort {
+		logger.FatalIf(errors.New("--console-address port cannot be same as --address port"), "Unable to start the server")
+	}
+
+	globalMinioAddr = addr
 
 	// Check "no-compat" flag from command line argument.
 	globalCLIContext.StrictS3Compat = true
@@ -258,6 +429,39 @@ func handleCommonEnvVars() {
 	globalBrowserEnabled, err = config.ParseBool(env.Get(config.EnvBrowser, config.EnableOn))
 	if err != nil {
 		logger.Fatal(config.ErrInvalidBrowserValue(err), "Invalid MINIO_BROWSER value in environment variable")
+	}
+	if globalBrowserEnabled {
+		if redirectURL := env.Get(config.EnvMinIOBrowserRedirectURL, ""); redirectURL != "" {
+			u, err := xnet.ParseHTTPURL(redirectURL)
+			if err != nil {
+				logger.Fatal(err, "Invalid MINIO_BROWSER_REDIRECT_URL value in environment variable")
+			}
+			// Look for if URL has invalid values and return error.
+			if !((u.Scheme == "http" || u.Scheme == "https") &&
+				(u.Path == "/" || u.Path == "") && u.Opaque == "" &&
+				!u.ForceQuery && u.RawQuery == "" && u.Fragment == "") {
+				err := fmt.Errorf("URL contains unexpected resources, expected URL to be of http(s)://minio.example.com format: %v", u)
+				logger.Fatal(err, "Invalid MINIO_BROWSER_REDIRECT_URL value is environment variable")
+			}
+			u.Path = "" // remove any path component such as `/`
+			globalBrowserRedirectURL = u
+		}
+	}
+
+	if serverURL := env.Get(config.EnvMinIOServerURL, ""); serverURL != "" {
+		u, err := xnet.ParseHTTPURL(serverURL)
+		if err != nil {
+			logger.Fatal(err, "Invalid MINIO_SERVER_URL value in environment variable")
+		}
+		// Look for if URL has invalid values and return error.
+		if !((u.Scheme == "http" || u.Scheme == "https") &&
+			(u.Path == "/" || u.Path == "") && u.Opaque == "" &&
+			!u.ForceQuery && u.RawQuery == "" && u.Fragment == "") {
+			err := fmt.Errorf("URL contains unexpected resources, expected URL to be of http(s)://minio.example.com format: %v", u)
+			logger.Fatal(err, "Invalid MINIO_SERVER_URL value is environment variable")
+		}
+		u.Path = "" // remove any path component such as `/`
+		globalMinioEndpoint = u.String()
 	}
 
 	globalFSOSync, err = config.ParseBool(env.Get(config.EnvFSOSync, config.EnableOff))
@@ -317,20 +521,50 @@ func handleCommonEnvVars() {
 	// in-place update is off.
 	globalInplaceUpdateDisabled = strings.EqualFold(env.Get(config.EnvUpdate, config.EnableOn), config.EnableOff)
 
-	if env.IsSet(config.EnvAccessKey) || env.IsSet(config.EnvSecretKey) {
-		cred, err := auth.CreateCredentials(env.Get(config.EnvAccessKey, ""), env.Get(config.EnvSecretKey, ""))
+	// Check if the supported credential env vars, "MINIO_ROOT_USER" and
+	// "MINIO_ROOT_PASSWORD" are provided
+	// Warn user if deprecated environment variables,
+	// "MINIO_ACCESS_KEY" and "MINIO_SECRET_KEY", are defined
+	// Check all error conditions first
+	if !env.IsSet(config.EnvRootUser) && env.IsSet(config.EnvRootPassword) {
+		logger.Fatal(config.ErrMissingEnvCredentialRootUser(nil), "Unable to start MinIO")
+	} else if env.IsSet(config.EnvRootUser) && !env.IsSet(config.EnvRootPassword) {
+		logger.Fatal(config.ErrMissingEnvCredentialRootPassword(nil), "Unable to start MinIO")
+	} else if !env.IsSet(config.EnvRootUser) && !env.IsSet(config.EnvRootPassword) {
+		if !env.IsSet(config.EnvAccessKey) && env.IsSet(config.EnvSecretKey) {
+			logger.Fatal(config.ErrMissingEnvCredentialAccessKey(nil), "Unable to start MinIO")
+		} else if env.IsSet(config.EnvAccessKey) && !env.IsSet(config.EnvSecretKey) {
+			logger.Fatal(config.ErrMissingEnvCredentialSecretKey(nil), "Unable to start MinIO")
+		}
+	}
+
+	// At this point, either both environment variables
+	// are defined or both are not defined.
+	// Check both cases and authenticate them if correctly defined
+	var user, password string
+	haveRootCredentials := false
+	haveAccessCredentials := false
+	if env.IsSet(config.EnvRootUser) && env.IsSet(config.EnvRootPassword) {
+		user = env.Get(config.EnvRootUser, "")
+		password = env.Get(config.EnvRootPassword, "")
+		haveRootCredentials = true
+	} else if env.IsSet(config.EnvAccessKey) && env.IsSet(config.EnvSecretKey) {
+		user = env.Get(config.EnvAccessKey, "")
+		password = env.Get(config.EnvSecretKey, "")
+		haveAccessCredentials = true
+	}
+	if haveRootCredentials || haveAccessCredentials {
+		cred, err := auth.CreateCredentials(user, password)
 		if err != nil {
 			logger.Fatal(config.ErrInvalidCredentials(err),
 				"Unable to validate credentials inherited from the shell environment")
 		}
-		globalActiveCred = cred
-	}
-
-	if env.IsSet(config.EnvRootUser) || env.IsSet(config.EnvRootPassword) {
-		cred, err := auth.CreateCredentials(env.Get(config.EnvRootUser, ""), env.Get(config.EnvRootPassword, ""))
-		if err != nil {
-			logger.Fatal(config.ErrInvalidCredentials(err),
-				"Unable to validate credentials inherited from the shell environment")
+		if haveAccessCredentials {
+			msg := fmt.Sprintf("WARNING: %s and %s are deprecated.\n"+
+				"         Please use %s and %s",
+				config.EnvAccessKey, config.EnvSecretKey,
+				config.EnvRootUser, config.EnvRootPassword)
+			logStartupMessage(color.RedBold(msg))
 		}
 		globalActiveCred = cred
 	}
@@ -392,9 +626,6 @@ func handleCommonEnvVars() {
 			logger.Fatal(err, "Unable to initialize a connection to KES as specified by the shell environment")
 		}
 		GlobalKMS = KMS
-	}
-	if tiers := env.Get("_MINIO_DEBUG_REMOTE_TIERS_IMMEDIATELY", ""); tiers != "" {
-		globalDebugRemoteTiersImmediately = strings.Split(tiers, ",")
 	}
 }
 

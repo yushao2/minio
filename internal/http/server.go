@@ -18,6 +18,7 @@
 package http
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"io/ioutil"
@@ -29,9 +30,9 @@ import (
 
 	humanize "github.com/dustin/go-humanize"
 
-	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/config/api"
+	xtls "github.com/minio/minio/internal/config/identity/tls"
 	"github.com/minio/minio/internal/fips"
 	"github.com/minio/pkg/certs"
 	"github.com/minio/pkg/env"
@@ -64,7 +65,7 @@ func (srv *Server) GetRequestCount() int {
 }
 
 // Start - start HTTP server
-func (srv *Server) Start() (err error) {
+func (srv *Server) Start(ctx context.Context) (err error) {
 	// Take a copy of server fields.
 	var tlsConfig *tls.Config
 	if srv.TLSConfig != nil {
@@ -72,12 +73,11 @@ func (srv *Server) Start() (err error) {
 	}
 	handler := srv.Handler // if srv.Handler holds non-synced state -> possible data race
 
-	addrs := set.CreateStringSet(srv.Addrs...).ToSlice() // copy and remove duplicates
-
 	// Create new HTTP listener.
 	var listener *httpListener
 	listener, err = newHTTPListener(
-		addrs,
+		ctx,
+		srv.Addrs,
 	)
 	if err != nil {
 		return err
@@ -90,7 +90,7 @@ func (srv *Server) Start() (err error) {
 		if atomic.LoadUint32(&srv.inShutdown) != 0 {
 			// To indicate disable keep-alives
 			w.Header().Set("Connection", "close")
-			w.WriteHeader(http.StatusForbidden)
+			w.WriteHeader(http.StatusServiceUnavailable)
 			w.Write([]byte(http.ErrServerClosed.Error()))
 			w.(http.Flusher).Flush()
 			return
@@ -164,7 +164,6 @@ func (srv *Server) Shutdown() error {
 // NewServer - creates new HTTP server using given arguments.
 func NewServer(addrs []string, handler http.Handler, getCert certs.GetCertificateFunc) *Server {
 	secureCiphers := env.Get(api.EnvAPISecureCiphers, config.EnableOn) == config.EnableOn
-
 	var tlsConfig *tls.Config
 	if getCert != nil {
 		tlsConfig = &tls.Config{
@@ -173,9 +172,21 @@ func NewServer(addrs []string, handler http.Handler, getCert certs.GetCertificat
 			NextProtos:               []string{"http/1.1", "h2"},
 			GetCertificate:           getCert,
 		}
+
+		tlsClientIdentity := env.Get(xtls.EnvIdentityTLSEnabled, "") == config.EnableOn
+		if tlsClientIdentity {
+			tlsConfig.ClientAuth = tls.RequestClientCert
+		}
+
 		if secureCiphers || fips.Enabled {
+			// Hardened ciphers
 			tlsConfig.CipherSuites = fips.CipherSuitesTLS()
 			tlsConfig.CurvePreferences = fips.EllipticCurvesTLS()
+		} else {
+			// Default ciphers while excluding those with security issues
+			for _, cipher := range tls.CipherSuites() {
+				tlsConfig.CipherSuites = append(tlsConfig.CipherSuites, cipher.ID)
+			}
 		}
 	}
 

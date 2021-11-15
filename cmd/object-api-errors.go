@@ -22,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"path"
 )
 
 // Converts underlying storage error. Convenience function written to
@@ -57,15 +56,6 @@ func toObjectErr(err error, params ...string) error {
 		return SlowDown{}
 	case errFileAccessDenied.Error():
 		apiErr := PrefixAccessDenied{}
-		if len(params) >= 1 {
-			apiErr.Bucket = params[0]
-		}
-		if len(params) >= 2 {
-			apiErr.Object = decodeDirObject(params[1])
-		}
-		return apiErr
-	case errFileParentIsFile.Error():
-		apiErr := ParentIsObject{}
 		if len(params) >= 1 {
 			apiErr.Bucket = params[0]
 		}
@@ -301,6 +291,13 @@ func (e MethodNotAllowed) Error() string {
 	return "Method not allowed: " + e.Bucket + "/" + e.Object
 }
 
+// ObjectLocked object is currently WORM protected.
+type ObjectLocked GenericError
+
+func (e ObjectLocked) Error() string {
+	return "Object is WORM protected and cannot be overwritten: " + e.Bucket + "/" + e.Object + "(" + e.VersionID + ")"
+}
+
 // ObjectAlreadyExists object already exists.
 type ObjectAlreadyExists GenericError
 
@@ -320,13 +317,6 @@ type PrefixAccessDenied GenericError
 
 func (e PrefixAccessDenied) Error() string {
 	return "Prefix access is denied: " + e.Bucket + SlashSeparator + e.Object
-}
-
-// ParentIsObject object access is denied.
-type ParentIsObject GenericError
-
-func (e ParentIsObject) Error() string {
-	return "Parent is object " + e.Bucket + SlashSeparator + path.Dir(e.Object)
 }
 
 // BucketExists bucket exists.
@@ -415,13 +405,6 @@ type BucketRemoteDestinationNotFound GenericError
 
 func (e BucketRemoteDestinationNotFound) Error() string {
 	return "Destination bucket does not exist: " + e.Bucket
-}
-
-// BucketReplicationDestinationMissingLock bucket does not have object lock enabled.
-type BucketReplicationDestinationMissingLock GenericError
-
-func (e BucketReplicationDestinationMissingLock) Error() string {
-	return "Destination bucket does not have object lock enabled: " + e.Bucket
 }
 
 // BucketRemoteTargetNotFound remote target does not exist.
@@ -662,10 +645,12 @@ func (e UnsupportedMetadata) Error() string {
 }
 
 // BackendDown is returned for network errors or if the gateway's backend is down.
-type BackendDown struct{}
+type BackendDown struct {
+	Err string
+}
 
 func (e BackendDown) Error() string {
-	return "Backend down"
+	return e.Err
 }
 
 // isErrBucketNotFound - Check if error type is BucketNotFound.
@@ -702,4 +687,10 @@ func (e PreConditionFailed) Error() string {
 func isErrPreconditionFailed(err error) bool {
 	_, ok := err.(PreConditionFailed)
 	return ok
+}
+
+// isErrMethodNotAllowed - Check if error type is MethodNotAllowed.
+func isErrMethodNotAllowed(err error) bool {
+	var methodNotAllowed MethodNotAllowed
+	return errors.As(err, &methodNotAllowed)
 }

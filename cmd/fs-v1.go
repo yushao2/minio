@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/user"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -54,9 +55,6 @@ var defaultEtag = "00000000000000000000000000000000-1"
 // FSObjects - Implements fs object layer.
 type FSObjects struct {
 	GatewayUnsupported
-
-	// The count of concurrent calls on FSObjects API
-	activeIOCount int64
 
 	// Path to be exported over S3 API.
 	fsPath string
@@ -176,7 +174,7 @@ func NewFSObjectLayer(fsPath string) (ObjectLayer, error) {
 	// or cause changes on backend format.
 	fs.fsFormatRlk = rlk
 
-	go fs.cleanupStaleUploads(ctx, GlobalStaleUploadsCleanupInterval, GlobalStaleUploadsExpiry)
+	go fs.cleanupStaleUploads(ctx)
 	go intDataUpdateTracker.start(ctx, fsPath)
 
 	// Return successfully initialized object layer.
@@ -214,11 +212,6 @@ func (fs *FSObjects) LocalStorageInfo(ctx context.Context) (StorageInfo, []error
 
 // StorageInfo - returns underlying storage statistics.
 func (fs *FSObjects) StorageInfo(ctx context.Context) (StorageInfo, []error) {
-	atomic.AddInt64(&fs.activeIOCount, 1)
-	defer func() {
-		atomic.AddInt64(&fs.activeIOCount, -1)
-	}()
-
 	di, err := getDiskInfo(fs.fsPath)
 	if err != nil {
 		return StorageInfo{}, []error{err}
@@ -226,6 +219,7 @@ func (fs *FSObjects) StorageInfo(ctx context.Context) (StorageInfo, []error) {
 	storageInfo := StorageInfo{
 		Disks: []madmin.Disk{
 			{
+				State:          madmin.DriveStateOk,
 				TotalSpace:     di.Total,
 				UsedSpace:      di.Used,
 				AvailableSpace: di.Free,
@@ -238,7 +232,7 @@ func (fs *FSObjects) StorageInfo(ctx context.Context) (StorageInfo, []error) {
 }
 
 // NSScanner returns data usage stats of the current FS deployment
-func (fs *FSObjects) NSScanner(ctx context.Context, bf *bloomFilter, updates chan<- madmin.DataUsageInfo) error {
+func (fs *FSObjects) NSScanner(ctx context.Context, bf *bloomFilter, updates chan<- DataUsageInfo, wantCycle uint32) error {
 	defer close(updates)
 	// Load bucket totals
 	var totalCache dataUsageCache
@@ -251,6 +245,18 @@ func (fs *FSObjects) NSScanner(ctx context.Context, bf *bloomFilter, updates cha
 	if err != nil {
 		return err
 	}
+	if len(buckets) == 0 {
+		totalCache.keepBuckets(buckets)
+		updates <- totalCache.dui(dataUsageRoot, buckets)
+		return nil
+	}
+	for i, b := range buckets {
+		if isReservedOrInvalidBucket(b.Name, false) {
+			// Delete bucket...
+			buckets = append(buckets[:i], buckets[i+1:]...)
+		}
+	}
+
 	totalCache.Info.BloomFilter = bf.bytes()
 
 	// Clear totals.
@@ -274,6 +280,7 @@ func (fs *FSObjects) NSScanner(ctx context.Context, bf *bloomFilter, updates cha
 			bCache.Info.Name = b.Name
 		}
 		bCache.Info.BloomFilter = totalCache.Info.BloomFilter
+		bCache.Info.NextCycle = wantCycle
 		upds := make(chan dataUsageEntry, 1)
 		var wg sync.WaitGroup
 		wg.Add(1)
@@ -282,7 +289,7 @@ func (fs *FSObjects) NSScanner(ctx context.Context, bf *bloomFilter, updates cha
 			for update := range upds {
 				totalCache.replace(b.Name, dataUsageRoot, update)
 				if intDataUpdateTracker.debug {
-					logger.Info(color.Green("NSScanner:")+" Got update:", len(totalCache.Cache))
+					logger.Info(color.Green("NSScanner:")+" Got update: %v", len(totalCache.Cache))
 				}
 				cloned := totalCache.clone()
 				updates <- cloned.dui(dataUsageRoot, buckets)
@@ -378,7 +385,9 @@ func (fs *FSObjects) scanBucket(ctx context.Context, bucket string, cache dataUs
 		}
 
 		oi := fsMeta.ToObjectInfo(bucket, object, fi)
-		sz := item.applyActions(ctx, fs, actionMeta{oi: oi}, &sizeSummary{})
+		atomic.AddUint64(&globalScannerStats.accTotalVersions, 1)
+		atomic.AddUint64(&globalScannerStats.accTotalObjects, 1)
+		sz := item.applyActions(ctx, fs, oi, &sizeSummary{})
 		if sz >= 0 {
 			return sizeSummary{totalSize: sz, versions: 1}, nil
 		}
@@ -426,11 +435,6 @@ func (fs *FSObjects) MakeBucketWithLocation(ctx context.Context, bucket string, 
 	}
 
 	defer NSUpdated(bucket, slashSeparator)
-
-	atomic.AddInt64(&fs.activeIOCount, 1)
-	defer func() {
-		atomic.AddInt64(&fs.activeIOCount, -1)
-	}()
 
 	bucketDir, err := fs.getBucketDir(ctx, bucket)
 	if err != nil {
@@ -492,11 +496,6 @@ func (fs *FSObjects) DeleteBucketPolicy(ctx context.Context, bucket string) erro
 
 // GetBucketInfo - fetch bucket metadata info.
 func (fs *FSObjects) GetBucketInfo(ctx context.Context, bucket string) (bi BucketInfo, e error) {
-	atomic.AddInt64(&fs.activeIOCount, 1)
-	defer func() {
-		atomic.AddInt64(&fs.activeIOCount, -1)
-	}()
-
 	st, err := fs.statBucketDir(ctx, bucket)
 	if err != nil {
 		return bi, toObjectErr(err, bucket)
@@ -521,12 +520,7 @@ func (fs *FSObjects) ListBuckets(ctx context.Context) ([]BucketInfo, error) {
 		return nil, err
 	}
 
-	atomic.AddInt64(&fs.activeIOCount, 1)
-	defer func() {
-		atomic.AddInt64(&fs.activeIOCount, -1)
-	}()
-
-	entries, err := readDir(fs.fsPath)
+	entries, err := readDirWithOpts(fs.fsPath, readDirOpts{count: -1, followDirSymlink: true})
 	if err != nil {
 		logger.LogIf(ctx, errDiskNotFound)
 		return nil, toObjectErr(errDiskNotFound)
@@ -571,20 +565,15 @@ func (fs *FSObjects) ListBuckets(ctx context.Context) ([]BucketInfo, error) {
 
 // DeleteBucket - delete a bucket and all the metadata associated
 // with the bucket including pending multipart, object metadata.
-func (fs *FSObjects) DeleteBucket(ctx context.Context, bucket string, forceDelete bool) error {
+func (fs *FSObjects) DeleteBucket(ctx context.Context, bucket string, opts DeleteBucketOptions) error {
 	defer NSUpdated(bucket, slashSeparator)
-
-	atomic.AddInt64(&fs.activeIOCount, 1)
-	defer func() {
-		atomic.AddInt64(&fs.activeIOCount, -1)
-	}()
 
 	bucketDir, err := fs.getBucketDir(ctx, bucket)
 	if err != nil {
 		return toObjectErr(err, bucket)
 	}
 
-	if !forceDelete {
+	if !opts.Force {
 		// Attempt to delete regular bucket.
 		if err = fsRemoveDir(ctx, bucketDir); err != nil {
 			return toObjectErr(err, bucket)
@@ -639,11 +628,6 @@ func (fs *FSObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBu
 		defer objectDWLock.Unlock(lkctx.Cancel)
 	}
 
-	atomic.AddInt64(&fs.activeIOCount, 1)
-	defer func() {
-		atomic.AddInt64(&fs.activeIOCount, -1)
-	}()
-
 	if _, err := fs.statBucketDir(ctx, srcBucket); err != nil {
 		return oi, toObjectErr(err, srcBucket)
 	}
@@ -674,8 +658,15 @@ func (fs *FSObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBu
 			return oi, toObjectErr(err, srcBucket, srcObject)
 		}
 
-		// Stat the file to get file size.
-		fi, err := fsStatFile(ctx, pathJoin(fs.fsPath, srcBucket, srcObject))
+		fsObjectPath := pathJoin(fs.fsPath, srcBucket, srcObject)
+
+		// Update object modtime
+		err = fsTouch(ctx, fsObjectPath)
+		if err != nil {
+			return oi, toObjectErr(err, srcBucket, srcObject)
+		}
+		// Stat the file to get object info
+		fi, err := fsStatFile(ctx, fsObjectPath)
 		if err != nil {
 			return oi, toObjectErr(err, srcBucket, srcObject)
 		}
@@ -709,11 +700,6 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 	if err = checkGetObjArgs(ctx, bucket, object); err != nil {
 		return nil, err
 	}
-
-	atomic.AddInt64(&fs.activeIOCount, 1)
-	defer func() {
-		atomic.AddInt64(&fs.activeIOCount, -1)
-	}()
 
 	if _, err = fs.statBucketDir(ctx, bucket); err != nil {
 		return nil, toObjectErr(err, bucket)
@@ -800,7 +786,7 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 		return nil, err
 	}
 
-	return objReaderFn(reader, h, opts.CheckPrecondFn, closeFn, rwPoolUnlocker, nsUnlocker)
+	return objReaderFn(reader, h, closeFn, rwPoolUnlocker, nsUnlocker)
 }
 
 // Create a new fs.json file, if the existing one is corrupt. Should happen very rarely.
@@ -833,6 +819,15 @@ func (fs *FSObjects) getObjectInfoNoFSLock(ctx context.Context, bucket, object s
 	fsMeta := fsMetaV1{}
 	if HasSuffix(object, SlashSeparator) {
 		fi, err := fsStatDir(ctx, pathJoin(fs.fsPath, bucket, object))
+		if err != nil {
+			return oi, err
+		}
+		return fsMeta.ToObjectInfo(bucket, object, fi), nil
+	}
+
+	if !globalCLIContext.StrictS3Compat {
+		// Stat the file to get file size.
+		fi, err := fsStatFile(ctx, pathJoin(fs.fsPath, bucket, object))
 		if err != nil {
 			return oi, err
 		}
@@ -965,11 +960,6 @@ func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, o
 		}
 	}
 
-	atomic.AddInt64(&fs.activeIOCount, 1)
-	defer func() {
-		atomic.AddInt64(&fs.activeIOCount, -1)
-	}()
-
 	oi, err := fs.getObjectInfoWithLock(ctx, bucket, object)
 	if err == errCorruptedFormat || err == io.EOF {
 		lk := fs.NewNSLock(bucket, object)
@@ -989,26 +979,6 @@ func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, o
 		return oi, toObjectErr(err, bucket, object)
 	}
 	return oi, toObjectErr(err, bucket, object)
-}
-
-// This function does the following check, suppose
-// object is "a/b/c/d", stat makes sure that objects ""a/b/c""
-// "a/b" and "a" do not exist.
-func (fs *FSObjects) parentDirIsObject(ctx context.Context, bucket, parent string) bool {
-	var isParentDirObject func(string) bool
-	isParentDirObject = func(p string) bool {
-		if p == "." || p == SlashSeparator {
-			return false
-		}
-		if fsIsFile(ctx, pathJoin(fs.fsPath, bucket, p)) {
-			// If there is already a file at prefix "p", return true.
-			return true
-		}
-
-		// Check if there is a file as one of the parent paths.
-		return isParentDirObject(path.Dir(p))
-	}
-	return isParentDirObject(parent)
 }
 
 // PutObject - creates an object upon reading from the input stream
@@ -1036,11 +1006,6 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 	ctx = lkctx.Context()
 	defer lk.Unlock(lkctx.Cancel)
 
-	atomic.AddInt64(&fs.activeIOCount, 1)
-	defer func() {
-		atomic.AddInt64(&fs.activeIOCount, -1)
-	}()
-
 	return fs.putObject(ctx, bucket, object, r, opts)
 }
 
@@ -1064,10 +1029,6 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 	// with a slash separator, we treat it like a valid operation
 	// and return success.
 	if isObjectDir(object, data.Size()) {
-		// Check if an object is present as one of the parent dir.
-		if fs.parentDirIsObject(ctx, bucket, path.Dir(object)) {
-			return ObjectInfo{}, toObjectErr(errFileParentIsFile, bucket, object)
-		}
 		if err = mkdirAll(pathJoin(fs.fsPath, bucket, object), 0777); err != nil {
 			logger.LogIf(ctx, err)
 			return ObjectInfo{}, toObjectErr(err, bucket, object)
@@ -1077,11 +1038,6 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 			return ObjectInfo{}, toObjectErr(err, bucket, object)
 		}
 		return fsMeta.ToObjectInfo(bucket, object, fi), nil
-	}
-
-	// Check if an object is present as one of the parent dir.
-	if fs.parentDirIsObject(ctx, bucket, path.Dir(object)) {
-		return ObjectInfo{}, toObjectErr(errFileParentIsFile, bucket, object)
 	}
 
 	// Validate input data size and it can never be less than zero.
@@ -1217,11 +1173,6 @@ func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, op
 		return objInfo, err
 	}
 
-	atomic.AddInt64(&fs.activeIOCount, 1)
-	defer func() {
-		atomic.AddInt64(&fs.activeIOCount, -1)
-	}()
-
 	if _, err = fs.statBucketDir(ctx, bucket); err != nil {
 		return objInfo, toObjectErr(err, bucket)
 	}
@@ -1311,11 +1262,6 @@ func (fs *FSObjects) ListObjectVersions(ctx context.Context, bucket, prefix, mar
 // ListObjects - list all objects at prefix upto maxKeys., optionally delimited by '/'. Maintains the list pool
 // state for future re-entrant list requests.
 func (fs *FSObjects) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (loi ListObjectsInfo, e error) {
-	atomic.AddInt64(&fs.activeIOCount, 1)
-	defer func() {
-		atomic.AddInt64(&fs.activeIOCount, -1)
-	}()
-
 	return listObjects(ctx, fs, bucket, prefix, marker, delimiter, maxKeys, fs.listPool,
 		fs.listDirFactory(), fs.isLeaf, fs.isLeafDir, fs.getObjectInfoNoFSLock, fs.getObjectInfoNoFSLock)
 }
@@ -1501,4 +1447,20 @@ func (fs *FSObjects) TransitionObject(ctx context.Context, bucket, object string
 // RestoreTransitionedObject - restore transitioned object content locally on this cluster.
 func (fs *FSObjects) RestoreTransitionedObject(ctx context.Context, bucket, object string, opts ObjectOptions) error {
 	return NotImplemented{}
+}
+
+// GetRawData returns raw file data to the callback.
+// Errors are ignored, only errors from the callback are returned.
+// For now only direct file paths are supported.
+func (fs *FSObjects) GetRawData(ctx context.Context, volume, file string, fn func(r io.Reader, host string, disk string, filename string, size int64, modtime time.Time, isDir bool) error) error {
+	f, err := os.Open(filepath.Join(fs.fsPath, volume, file))
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.IsDir() {
+		return nil
+	}
+	return fn(f, "fs", fs.fsUUID, file, st.Size(), st.ModTime(), st.IsDir())
 }

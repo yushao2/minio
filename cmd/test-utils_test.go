@@ -31,7 +31,6 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"encoding/pem"
 	"encoding/xml"
 	"errors"
@@ -46,6 +45,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path"
 	"reflect"
 	"sort"
 	"strconv"
@@ -63,7 +63,6 @@ import (
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/hash"
-	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/rest"
 	"github.com/minio/pkg/bucket/policy"
@@ -105,8 +104,6 @@ func TestMain(m *testing.M) {
 
 	// Initialize globalConsoleSys system
 	globalConsoleSys = NewConsoleLogger(context.Background())
-
-	globalDNSCache = xhttp.NewDNSCache(3*time.Second, 10*time.Second, logger.LogOnceIf)
 
 	globalInternodeTransport = newInternodeHTTPTransport(nil, rest.DefaultTimeout)()
 
@@ -223,7 +220,10 @@ func initFSObjects(disk string, t *testing.T) (obj ObjectLayer) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	newTestConfig(globalMinioDefaultRegion, obj)
+
+	newAllSubsystems()
 	return obj
 }
 
@@ -292,13 +292,14 @@ func isSameType(obj1, obj2 interface{}) bool {
 //   s := StartTestServer(t,"Erasure")
 //   defer s.Stop()
 type TestServer struct {
-	Root      string
-	Disks     EndpointServerPools
-	AccessKey string
-	SecretKey string
-	Server    *httptest.Server
-	Obj       ObjectLayer
-	cancel    context.CancelFunc
+	Root         string
+	Disks        EndpointServerPools
+	AccessKey    string
+	SecretKey    string
+	Server       *httptest.Server
+	Obj          ObjectLayer
+	cancel       context.CancelFunc
+	rawDiskPaths []string
 }
 
 // UnstartedTestServer - Configures a temp FS/Erasure backend,
@@ -314,16 +315,22 @@ func UnstartedTestServer(t TestErrHandler, instanceType string) TestServer {
 		t.Fatal(err)
 	}
 
-	// set the server configuration.
+	// set new server configuration.
 	if err = newTestConfig(globalMinioDefaultRegion, objLayer); err != nil {
 		t.Fatalf("%s", err)
 	}
 
+	return initTestServerWithBackend(ctx, t, testServer, objLayer, disks)
+}
+
+// initializes a test server with the given object layer and disks.
+func initTestServerWithBackend(ctx context.Context, t TestErrHandler, testServer TestServer, objLayer ObjectLayer, disks []string) TestServer {
 	// Test Server needs to start before formatting of disks.
 	// Get credential.
 	credentials := globalActiveCred
 
 	testServer.Obj = objLayer
+	testServer.rawDiskPaths = disks
 	testServer.Disks = mustGetPoolEndpoints(disks...)
 	testServer.AccessKey = credentials.AccessKey
 	testServer.SecretKey = credentials.SecretKey
@@ -334,7 +341,7 @@ func UnstartedTestServer(t TestErrHandler, instanceType string) TestServer {
 	}
 
 	// Run TestServer.
-	testServer.Server = httptest.NewUnstartedServer(criticalErrorHandler{corsHandler(httpHandler)})
+	testServer.Server = httptest.NewUnstartedServer(setCriticalErrorHandler(corsHandler(httpHandler)))
 
 	globalObjLayerMutex.Lock()
 	globalObjectAPI = objLayer
@@ -348,9 +355,11 @@ func UnstartedTestServer(t TestErrHandler, instanceType string) TestServer {
 
 	newAllSubsystems()
 
+	globalEtcdClient = nil
+
 	initAllSubsystems(ctx, objLayer)
 
-	globalIAMSys.InitStore(objLayer)
+	globalIAMSys.Init(ctx, objLayer, globalEtcdClient, 2*time.Second)
 
 	return testServer
 }
@@ -1172,78 +1181,6 @@ func newTestSignedRequestV4(method, urlStr string, contentLength int64, body io.
 	return req, nil
 }
 
-// Return new WebRPC request object.
-func newWebRPCRequest(methodRPC, authorization string, body io.ReadSeeker) (*http.Request, error) {
-	req, err := http.NewRequest(http.MethodPost, "/minio/webrpc", nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "Mozilla")
-	req.Header.Set("Content-Type", "application/json")
-	if authorization != "" {
-		req.Header.Set("Authorization", "Bearer "+authorization)
-	}
-	// Seek back to beginning.
-	if body != nil {
-		body.Seek(0, 0)
-		// Add body
-		req.Body = ioutil.NopCloser(body)
-	} else {
-		// this is added to avoid panic during ioutil.ReadAll(req.Body).
-		// th stack trace can be found here  https://github.com/minio/minio/pull/2074 .
-		// This is very similar to https://github.com/golang/go/issues/7527.
-		req.Body = ioutil.NopCloser(bytes.NewReader([]byte("")))
-	}
-	return req, nil
-}
-
-// Marshal request and return a new HTTP request object to call the webrpc
-func newTestWebRPCRequest(rpcMethod string, authorization string, data interface{}) (*http.Request, error) {
-	type genericJSON struct {
-		JSONRPC string      `json:"jsonrpc"`
-		ID      string      `json:"id"`
-		Method  string      `json:"method"`
-		Params  interface{} `json:"params"`
-	}
-	encapsulatedData := genericJSON{JSONRPC: "2.0", ID: "1", Method: rpcMethod, Params: data}
-	jsonData, err := json.Marshal(encapsulatedData)
-	if err != nil {
-		return nil, err
-	}
-	req, err := newWebRPCRequest(rpcMethod, authorization, bytes.NewReader(jsonData))
-	if err != nil {
-		return nil, err
-	}
-	return req, nil
-}
-
-type ErrWebRPC struct {
-	Code    int         `json:"code"`
-	Message string      `json:"message"`
-	Data    interface{} `json:"data"`
-}
-
-// Unmarshal response and return the webrpc response
-func getTestWebRPCResponse(resp *httptest.ResponseRecorder, data interface{}) error {
-	type rpcReply struct {
-		ID      string      `json:"id"`
-		JSONRPC string      `json:"jsonrpc"`
-		Result  interface{} `json:"result"`
-		Error   *ErrWebRPC  `json:"error"`
-	}
-	reply := &rpcReply{Result: &data}
-	err := json.NewDecoder(resp.Body).Decode(reply)
-	if err != nil {
-		return err
-	}
-	// For the moment, web handlers errors code are not meaningful
-	// Return only the error message
-	if reply.Error != nil {
-		return errors.New(reply.Error.Message)
-	}
-	return nil
-}
-
 // Function to generate random string for bucket/object names.
 func randString(n int) string {
 	src := rand.NewSource(UTCNow().UnixNano())
@@ -1540,10 +1477,6 @@ func newTestObjectLayer(ctx context.Context, endpointServerPools EndpointServerP
 
 	newAllSubsystems()
 
-	initAllSubsystems(ctx, z)
-
-	globalIAMSys.InitStore(z)
-
 	return z, nil
 }
 
@@ -1585,12 +1518,12 @@ func removeDiskN(disks []string, n int) {
 // initializes the specified API endpoints for the tests.
 // initialies the root and returns its path.
 // return credentials.
-func initAPIHandlerTest(obj ObjectLayer, endpoints []string) (string, http.Handler, error) {
+func initAPIHandlerTest(ctx context.Context, obj ObjectLayer, endpoints []string) (string, http.Handler, error) {
 	newAllSubsystems()
 
-	initAllSubsystems(context.Background(), obj)
+	initAllSubsystems(ctx, obj)
 
-	globalIAMSys.InitStore(obj)
+	globalIAMSys.Init(ctx, obj, globalEtcdClient, 2*time.Second)
 
 	// get random bucket name.
 	bucketName := getRandomBucketName()
@@ -1721,12 +1654,8 @@ func ExecObjectLayerAPIAnonTest(t *testing.T, obj ObjectLayer, testName, bucketN
 			t.Fatal(failTestStr(unknownSignTestStr, "error response failed to parse error XML"))
 		}
 
-		if actualError.BucketName != bucketName {
-			t.Fatal(failTestStr(unknownSignTestStr, "error response bucket name differs from expected value"))
-		}
-
-		if actualError.Key != objectName {
-			t.Fatal(failTestStr(unknownSignTestStr, "error response object name differs from expected value"))
+		if path.Clean(actualError.Resource) != pathJoin(SlashSeparator, bucketName, SlashSeparator, objectName) {
+			t.Fatal(failTestStr(unknownSignTestStr, "error response resource differs from expected value"))
 		}
 	}
 
@@ -1803,7 +1732,7 @@ func ExecObjectLayerAPITest(t *testing.T, objAPITest objAPITestType, endpoints [
 		t.Fatalf("Initialization of object layer failed for single node setup: %s", err)
 	}
 
-	bucketFS, fsAPIRouter, err := initAPIHandlerTest(objLayer, endpoints)
+	bucketFS, fsAPIRouter, err := initAPIHandlerTest(ctx, objLayer, endpoints)
 	if err != nil {
 		t.Fatalf("Initialization of API handler tests failed: <ERROR> %s", err)
 	}
@@ -1825,7 +1754,7 @@ func ExecObjectLayerAPITest(t *testing.T, objAPITest objAPITestType, endpoints [
 	}
 	defer objLayer.Shutdown(ctx)
 
-	bucketErasure, erAPIRouter, err := initAPIHandlerTest(objLayer, endpoints)
+	bucketErasure, erAPIRouter, err := initAPIHandlerTest(ctx, objLayer, endpoints)
 	if err != nil {
 		t.Fatalf("Initialzation of API handler tests failed: <ERROR> %s", err)
 	}
@@ -1860,59 +1789,63 @@ type objTestDiskNotFoundType func(obj ObjectLayer, instanceType string, dirs []s
 // ExecObjectLayerTest - executes object layer tests.
 // Creates single node and Erasure ObjectLayer instance and runs test for both the layers.
 func ExecObjectLayerTest(t TestErrHandler, objTest objTestType) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	{
+		ctx, cancel := context.WithCancel(context.Background())
+		if localMetacacheMgr != nil {
+			localMetacacheMgr.deleteAll()
+		}
 
-	if localMetacacheMgr != nil {
-		localMetacacheMgr.deleteAll()
+		objLayer, fsDir, err := prepareFS()
+		if err != nil {
+			t.Fatalf("Initialization of object layer failed for single node setup: %s", err)
+		}
+		setObjectLayer(objLayer)
+
+		newAllSubsystems()
+
+		// initialize the server and obtain the credentials and root.
+		// credentials are necessary to sign the HTTP request.
+		if err = newTestConfig(globalMinioDefaultRegion, objLayer); err != nil {
+			t.Fatal("Unexpected error", err)
+		}
+		initAllSubsystems(ctx, objLayer)
+		globalIAMSys.Init(ctx, objLayer, globalEtcdClient, 2*time.Second)
+
+		// Executing the object layer tests for single node setup.
+		objTest(objLayer, FSTestStr, t)
+
+		// Call clean up functions
+		cancel()
+		setObjectLayer(newObjectLayerFn())
+		removeRoots([]string{fsDir})
 	}
-	defer setObjectLayer(newObjectLayerFn())
 
-	objLayer, fsDir, err := prepareFS()
-	if err != nil {
-		t.Fatalf("Initialization of object layer failed for single node setup: %s", err)
-	}
-	setObjectLayer(objLayer)
+	{
+		ctx, cancel := context.WithCancel(context.Background())
 
-	newAllSubsystems()
+		if localMetacacheMgr != nil {
+			localMetacacheMgr.deleteAll()
+		}
 
-	// initialize the server and obtain the credentials and root.
-	// credentials are necessary to sign the HTTP request.
-	if err = newTestConfig(globalMinioDefaultRegion, objLayer); err != nil {
-		t.Fatal("Unexpected error", err)
-	}
+		newAllSubsystems()
+		objLayer, fsDirs, err := prepareErasureSets32(ctx)
+		if err != nil {
+			t.Fatalf("Initialization of object layer failed for Erasure setup: %s", err)
+		}
+		setObjectLayer(objLayer)
+		initAllSubsystems(ctx, objLayer)
+		globalIAMSys.Init(ctx, objLayer, globalEtcdClient, 2*time.Second)
 
-	initAllSubsystems(ctx, objLayer)
+		// Executing the object layer tests for Erasure.
+		objTest(objLayer, ErasureTestStr, t)
 
-	globalIAMSys.InitStore(objLayer)
-
-	// Executing the object layer tests for single node setup.
-	objTest(objLayer, FSTestStr, t)
-
-	if localMetacacheMgr != nil {
-		localMetacacheMgr.deleteAll()
-	}
-	defer setObjectLayer(newObjectLayerFn())
-
-	newAllSubsystems()
-	objLayer, fsDirs, err := prepareErasureSets32(ctx)
-	if err != nil {
-		t.Fatalf("Initialization of object layer failed for Erasure setup: %s", err)
-	}
-	setObjectLayer(objLayer)
-
-	defer objLayer.Shutdown(context.Background())
-
-	initAllSubsystems(ctx, objLayer)
-
-	globalIAMSys.InitStore(objLayer)
-
-	defer removeRoots(append(fsDirs, fsDir))
-	// Executing the object layer tests for Erasure.
-	objTest(objLayer, ErasureTestStr, t)
-
-	if localMetacacheMgr != nil {
-		localMetacacheMgr.deleteAll()
+		objLayer.Shutdown(context.Background())
+		if localMetacacheMgr != nil {
+			localMetacacheMgr.deleteAll()
+		}
+		setObjectLayer(newObjectLayerFn())
+		cancel()
+		removeRoots(fsDirs)
 	}
 }
 
@@ -2108,25 +2041,15 @@ func registerAPIFunctions(muxRouter *mux.Router, objLayer ObjectLayer, apiFuncti
 func initTestAPIEndPoints(objLayer ObjectLayer, apiFunctions []string) http.Handler {
 	// initialize a new mux router.
 	// goriilla/mux is the library used to register all the routes and handle them.
-	muxRouter := mux.NewRouter().SkipClean(true)
+	muxRouter := mux.NewRouter().SkipClean(true).UseEncodedPath()
 	if len(apiFunctions) > 0 {
 		// Iterate the list of API functions requested for and register them in mux HTTP handler.
 		registerAPIFunctions(muxRouter, objLayer, apiFunctions...)
+		muxRouter.Use(globalHandlers...)
 		return muxRouter
 	}
 	registerAPIRouter(muxRouter)
-	return muxRouter
-}
-
-// Initialize Web RPC Handlers for testing
-func initTestWebRPCEndPoint(objLayer ObjectLayer) http.Handler {
-	globalObjLayerMutex.Lock()
-	globalObjectAPI = objLayer
-	globalObjLayerMutex.Unlock()
-
-	// Initialize router.
-	muxRouter := mux.NewRouter().SkipClean(true)
-	registerWebRouter(muxRouter)
+	muxRouter.Use(globalHandlers...)
 	return muxRouter
 }
 

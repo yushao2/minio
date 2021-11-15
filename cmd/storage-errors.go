@@ -17,7 +17,12 @@
 
 package cmd
 
-import "errors"
+import (
+	"context"
+	"errors"
+
+	"github.com/minio/minio/internal/logger"
+)
 
 // errUnexpected - unexpected error, requires manual intervention.
 var errUnexpected = StorageErr("unexpected error, please report this issue at https://github.com/minio/minio/issues")
@@ -88,9 +93,6 @@ var errFileAccessDenied = StorageErr("file access denied")
 // errFileCorrupt - file has an unexpected size, or is not readable
 var errFileCorrupt = StorageErr("file is corrupted")
 
-// errFileParentIsFile - cannot have overlapping objects, parent is already a file.
-var errFileParentIsFile = StorageErr("parent is a file")
-
 // errBitrotHashAlgoInvalid - the algo for bit-rot hash
 // verification is empty or invalid.
 var errBitrotHashAlgoInvalid = StorageErr("bit-rot hash algorithm is invalid")
@@ -160,7 +162,11 @@ func osErrToFileErr(err error) error {
 		return errFaultyDisk
 	}
 	if isSysErrInvalidArg(err) {
-		return errUnsupportedDisk
+		logger.LogIf(context.Background(), err)
+		// For some odd calls with O_DIRECT reads
+		// filesystems can return EINVAL, handle
+		// these as FileNotFound instead.
+		return errFileNotFound
 	}
 	if isSysErrNoSpace(err) {
 		return errDiskFull

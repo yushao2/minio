@@ -18,7 +18,7 @@
 package cmd
 
 const (
-	storageRESTVersion       = "v36" // Changes to FileInfo for tier-journal
+	storageRESTVersion       = "v41" // Optimized DeleteVersions API
 	storageRESTVersionPrefix = SlashSeparator + storageRESTVersion
 	storageRESTPrefix        = minioReservedBucketPath + "/storage"
 )
@@ -42,7 +42,6 @@ const (
 	storageRESTMethodReadVersion    = "/readversion"
 	storageRESTMethodRenameData     = "/renamedata"
 	storageRESTMethodCheckParts     = "/checkparts"
-	storageRESTMethodCheckFile      = "/checkfile"
 	storageRESTMethodReadAll        = "/readall"
 	storageRESTMethodReadFile       = "/readfile"
 	storageRESTMethodReadFileStream = "/readfilestream"
@@ -52,6 +51,7 @@ const (
 	storageRESTMethodRenameFile     = "/renamefile"
 	storageRESTMethodVerifyFile     = "/verifyfile"
 	storageRESTMethodWalkDir        = "/walkdir"
+	storageRESTMethodStatInfoFile   = "/statfile"
 )
 
 const (
@@ -78,4 +78,5 @@ const (
 	storageRESTBitrotHash     = "bitrot-hash"
 	storageRESTDiskID         = "disk-id"
 	storageRESTForceDelete    = "force-delete"
+	storageRESTGlob           = "glob"
 )

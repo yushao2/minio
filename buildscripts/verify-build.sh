@@ -20,6 +20,7 @@ export SECRET_KEY="minio123"
 export ENABLE_HTTPS=0
 export GO111MODULE=on
 export GOGC=25
+export ENABLE_ADMIN=1
 
 MINIO_CONFIG_DIR="$WORK_DIR/.minio"
 MINIO=( "$PWD/minio" --config-dir "$MINIO_CONFIG_DIR" )
@@ -31,6 +32,8 @@ FUNCTIONAL_TESTS="$WORK_DIR/functional-tests.sh"
 
 function start_minio_fs()
 {
+    export MINIO_ROOT_USER=$ACCESS_KEY
+    export MINIO_ROOT_PASSWORD=$SECRET_KEY
     "${MINIO[@]}" server "${WORK_DIR}/fs-disk" >"$WORK_DIR/fs-minio.log" 2>&1 &
     sleep 10
 }

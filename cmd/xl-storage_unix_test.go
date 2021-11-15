@@ -1,3 +1,4 @@
+//go:build linux || darwin || dragonfly || freebsd || netbsd || openbsd
 // +build linux darwin dragonfly freebsd netbsd openbsd
 
 // Copyright (c) 2015-2021 MinIO, Inc.
@@ -113,7 +114,7 @@ func TestIsValidUmaskFile(t *testing.T) {
 	}
 
 	// CheckFile - stat the file.
-	if err := disk.CheckFile(context.Background(), testCase.volName, "hello-world.txt"); err != nil {
+	if _, err := disk.StatInfoFile(context.Background(), testCase.volName, "hello-world.txt/"+xlStorageFormatFile, false); err != nil {
 		t.Fatalf("Stat failed with %s expected to pass.", err)
 	}
 }

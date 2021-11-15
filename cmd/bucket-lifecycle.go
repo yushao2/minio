@@ -24,9 +24,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -75,8 +75,9 @@ func NewLifecycleSys() *LifecycleSys {
 }
 
 type expiryTask struct {
-	objInfo       ObjectInfo
-	versionExpiry bool
+	objInfo        ObjectInfo
+	versionExpiry  bool
+	restoredObject bool
 }
 
 type expiryState struct {
@@ -84,13 +85,18 @@ type expiryState struct {
 	expiryCh chan expiryTask
 }
 
-func (es *expiryState) queueExpiryTask(oi ObjectInfo, rmVersion bool) {
+// PendingTasks returns the number of pending ILM expiry tasks.
+func (es *expiryState) PendingTasks() int {
+	return len(es.expiryCh)
+}
+
+func (es *expiryState) queueExpiryTask(oi ObjectInfo, restoredObject bool, rmVersion bool) {
 	select {
 	case <-GlobalContext.Done():
 		es.once.Do(func() {
 			close(es.expiryCh)
 		})
-	case es.expiryCh <- expiryTask{objInfo: oi, versionExpiry: rmVersion}:
+	case es.expiryCh <- expiryTask{objInfo: oi, versionExpiry: rmVersion, restoredObject: restoredObject}:
 	default:
 	}
 }
@@ -109,15 +115,26 @@ func initBackgroundExpiry(ctx context.Context, objectAPI ObjectLayer) {
 	globalExpiryState = newExpiryState()
 	go func() {
 		for t := range globalExpiryState.expiryCh {
-			applyExpiryRule(ctx, objectAPI, t.objInfo, false, t.versionExpiry)
+			if t.objInfo.TransitionedObject.Status != "" {
+				applyExpiryOnTransitionedObject(ctx, objectAPI, t.objInfo, t.restoredObject)
+			} else {
+				applyExpiryOnNonTransitionedObjects(ctx, objectAPI, t.objInfo, t.versionExpiry)
+			}
 		}
 	}()
 }
 
 type transitionState struct {
-	once sync.Once
-	// add future metrics here
+	once         sync.Once
 	transitionCh chan ObjectInfo
+
+	ctx        context.Context
+	objAPI     ObjectLayer
+	mu         sync.Mutex
+	numWorkers int
+	killCh     chan struct{}
+
+	activeTasks int32
 }
 
 func (t *transitionState) queueTransitionTask(oi ObjectInfo) {
@@ -132,64 +149,100 @@ func (t *transitionState) queueTransitionTask(oi ObjectInfo) {
 }
 
 var (
-	globalTransitionState      *transitionState
-	globalTransitionConcurrent = runtime.GOMAXPROCS(0) / 2
+	globalTransitionState *transitionState
 )
 
-func newTransitionState() *transitionState {
-	// fix minimum concurrent transition to 1 for single CPU setup
-	if globalTransitionConcurrent == 0 {
-		globalTransitionConcurrent = 1
-	}
+func newTransitionState(ctx context.Context, objAPI ObjectLayer) *transitionState {
 	return &transitionState{
 		transitionCh: make(chan ObjectInfo, 10000),
+		ctx:          ctx,
+		objAPI:       objAPI,
+		killCh:       make(chan struct{}),
 	}
 }
 
-// addWorker creates a new worker to process tasks
-func (t *transitionState) addWorker(ctx context.Context, objectAPI ObjectLayer) {
-	// Add a new worker.
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case oi, ok := <-t.transitionCh:
-				if !ok {
-					return
-				}
+// PendingTasks returns the number of ILM transition tasks waiting for a worker
+// goroutine.
+func (t *transitionState) PendingTasks() int {
+	return len(globalTransitionState.transitionCh)
+}
 
-				if err := transitionObject(ctx, objectAPI, oi); err != nil {
-					logger.LogIf(ctx, fmt.Errorf("Transition failed for %s/%s version:%s with %w", oi.Bucket, oi.Name, oi.VersionID, err))
-				}
+// ActiveTasks returns the number of active (ongoing) ILM transition tasks.
+func (t *transitionState) ActiveTasks() int {
+	return int(atomic.LoadInt32(&t.activeTasks))
+}
+
+// worker waits for transition tasks
+func (t *transitionState) worker(ctx context.Context, objectAPI ObjectLayer) {
+	for {
+		select {
+		case <-t.killCh:
+			return
+		case <-ctx.Done():
+			return
+		case oi, ok := <-t.transitionCh:
+			if !ok {
+				return
 			}
+			atomic.AddInt32(&t.activeTasks, 1)
+			if err := transitionObject(ctx, objectAPI, oi); err != nil {
+				logger.LogIf(ctx, fmt.Errorf("Transition failed for %s/%s version:%s with %w", oi.Bucket, oi.Name, oi.VersionID, err))
+			}
+			atomic.AddInt32(&t.activeTasks, -1)
 		}
-	}()
+	}
+}
+
+// UpdateWorkers at the end of this function leaves n goroutines waiting for
+// transition tasks
+func (t *transitionState) UpdateWorkers(n int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	for t.numWorkers < n {
+		go t.worker(t.ctx, t.objAPI)
+		t.numWorkers++
+	}
+
+	for t.numWorkers > n {
+		go func() { t.killCh <- struct{}{} }()
+		t.numWorkers--
+	}
 }
 
 func initBackgroundTransition(ctx context.Context, objectAPI ObjectLayer) {
-	if globalTransitionState == nil {
-		return
-	}
-
-	// Start with globalTransitionConcurrent.
-	for i := 0; i < globalTransitionConcurrent; i++ {
-		globalTransitionState.addWorker(ctx, objectAPI)
-	}
+	globalTransitionState = newTransitionState(ctx, objectAPI)
+	n := globalAPIConfig.getTransitionWorkers()
+	globalTransitionState.UpdateWorkers(n)
 }
 
 var errInvalidStorageClass = errors.New("invalid storage class")
 
-func validateTransitionTier(ctx context.Context, lfc *lifecycle.Lifecycle) error {
-	for _, rule := range lfc.Rules {
-		if rule.Transition.StorageClass == "" {
-			continue
+func validateTransitionTier(lc *lifecycle.Lifecycle) error {
+	for _, rule := range lc.Rules {
+		if rule.Transition.StorageClass != "" {
+			if valid := globalTierConfigMgr.IsTierValid(rule.Transition.StorageClass); !valid {
+				return errInvalidStorageClass
+			}
 		}
-		if valid := globalTierConfigMgr.IsTierValid(rule.Transition.StorageClass); !valid {
-			return errInvalidStorageClass
+		if rule.NoncurrentVersionTransition.StorageClass != "" {
+			if valid := globalTierConfigMgr.IsTierValid(rule.NoncurrentVersionTransition.StorageClass); !valid {
+				return errInvalidStorageClass
+			}
 		}
 	}
 	return nil
+}
+
+// enqueueTransitionImmediate enqueues obj for transition if eligible.
+// This is to be called after a successful upload of an object (version).
+func enqueueTransitionImmediate(obj ObjectInfo) {
+	if lc, err := globalLifecycleSys.Get(obj.Bucket); err == nil {
+		switch lc.ComputeAction(obj.ToLifecycleOpts()) {
+		case lifecycle.TransitionAction, lifecycle.TransitionVersionAction:
+			globalTransitionState.queueTransitionTask(obj)
+		}
+	}
 }
 
 // expireAction represents different actions to be performed on expiry of a
@@ -214,14 +267,15 @@ func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *Ob
 	var opts ObjectOptions
 	opts.Versioned = globalBucketVersioningSys.Enabled(oi.Bucket)
 	opts.VersionID = lcOpts.VersionID
+	opts.Expiration = ExpirationOptions{Expire: true}
 	switch action {
 	case expireObj:
 		// When an object is past expiry or when a transitioned object is being
 		// deleted, 'mark' the data in the remote tier for delete.
 		entry := jentry{
-			ObjName:   oi.transitionedObjName,
-			VersionID: oi.transitionVersionID,
-			TierName:  oi.TransitionTier,
+			ObjName:   oi.TransitionedObject.Name,
+			VersionID: oi.TransitionedObject.VersionID,
+			TierName:  oi.TransitionedObject.Tier,
 		}
 		if err := globalTierJournal.AddEntry(entry); err != nil {
 			logger.LogIf(ctx, err)
@@ -235,7 +289,7 @@ func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *Ob
 		}
 
 		// Send audit for the lifecycle delete operation
-		auditLogLifecycle(ctx, oi.Bucket, oi.Name)
+		auditLogLifecycle(ctx, *oi, ILMExpiry)
 
 		eventName := event.ObjectRemovedDelete
 		if lcOpts.DeleteMarker {
@@ -269,13 +323,13 @@ func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *Ob
 }
 
 // generate an object name for transitioned object
-func genTransitionObjName() (string, error) {
+func genTransitionObjName(bucket string) (string, error) {
 	u, err := uuid.NewRandom()
 	if err != nil {
 		return "", err
 	}
 	us := u.String()
-	obj := fmt.Sprintf("%s/%s/%s", us[0:2], us[2:4], us)
+	obj := fmt.Sprintf("%s/%s/%s/%s/%s", globalDeploymentID, bucket, us[0:2], us[2:4], us)
 	return obj, nil
 }
 
@@ -288,37 +342,23 @@ func transitionObject(ctx context.Context, objectAPI ObjectLayer, oi ObjectInfo)
 	if err != nil {
 		return err
 	}
-	lcOpts := lifecycle.ObjectOpts{
-		Name:     oi.Name,
-		UserTags: oi.UserTags,
-	}
-	tierName := getLifeCycleTransitionTier(ctx, lc, oi.Bucket, lcOpts)
 	opts := ObjectOptions{
 		Transition: TransitionOptions{
 			Status: lifecycle.TransitionPending,
-			Tier:   tierName,
+			Tier:   lc.TransitionTier(oi.ToLifecycleOpts()),
 			ETag:   oi.ETag,
 		},
-		VersionID: oi.VersionID,
-		Versioned: globalBucketVersioningSys.Enabled(oi.Bucket),
-		MTime:     oi.ModTime,
+		VersionID:        oi.VersionID,
+		Versioned:        globalBucketVersioningSys.Enabled(oi.Bucket),
+		VersionSuspended: globalBucketVersioningSys.Suspended(oi.Bucket),
+		MTime:            oi.ModTime,
 	}
 	return objectAPI.TransitionObject(ctx, oi.Bucket, oi.Name, opts)
 }
 
-// getLifeCycleTransitionTier returns storage class for transition target
-func getLifeCycleTransitionTier(ctx context.Context, lc *lifecycle.Lifecycle, bucket string, obj lifecycle.ObjectOpts) string {
-	for _, rule := range lc.FilterActionableRules(obj) {
-		if rule.Transition.StorageClass != "" {
-			return rule.Transition.StorageClass
-		}
-	}
-	return ""
-}
-
 // getTransitionedObjectReader returns a reader from the transitioned tier.
 func getTransitionedObjectReader(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, oi ObjectInfo, opts ObjectOptions) (gr *GetObjectReader, err error) {
-	tgtClient, err := globalTierConfigMgr.getDriver(oi.TransitionTier)
+	tgtClient, err := globalTierConfigMgr.getDriver(oi.TransitionedObject.Tier)
 	if err != nil {
 		return nil, fmt.Errorf("transition storage class not configured")
 	}
@@ -335,14 +375,14 @@ func getTransitionedObjectReader(ctx context.Context, bucket, object string, rs 
 		gopts.length = length
 	}
 
-	reader, err := tgtClient.Get(ctx, oi.transitionedObjName, remoteVersionID(oi.transitionVersionID), gopts)
+	reader, err := tgtClient.Get(ctx, oi.TransitionedObject.Name, remoteVersionID(oi.TransitionedObject.VersionID), gopts)
 	if err != nil {
 		return nil, err
 	}
 	closer := func() {
 		reader.Close()
 	}
-	return fn(reader, h, opts.CheckPrecondFn, closer)
+	return fn(reader, h, closer)
 }
 
 // RestoreRequestType represents type of restore.
@@ -355,9 +395,9 @@ const (
 
 // Encryption specifies encryption setting on restored bucket
 type Encryption struct {
-	EncryptionType sse.SSEAlgorithm `xml:"EncryptionType"`
-	KMSContext     string           `xml:"KMSContext,omitempty"`
-	KMSKeyID       string           `xml:"KMSKeyId,omitempty"`
+	EncryptionType sse.Algorithm `xml:"EncryptionType"`
+	KMSContext     string        `xml:"KMSContext,omitempty"`
+	KMSKeyID       string        `xml:"KMSKeyId,omitempty"`
 }
 
 // MetadataEntry denotes name and value.
@@ -473,7 +513,7 @@ func (r *RestoreObjectRequest) validate(ctx context.Context, objAPI ObjectLayer)
 func postRestoreOpts(ctx context.Context, r *http.Request, bucket, object string) (opts ObjectOptions, err error) {
 	versioned := globalBucketVersioningSys.Enabled(bucket)
 	versionSuspended := globalBucketVersioningSys.Suspended(bucket)
-	vid := strings.TrimSpace(r.URL.Query().Get(xhttp.VersionID))
+	vid := strings.TrimSpace(r.Form.Get(xhttp.VersionID))
 	if vid != "" && vid != nullVersionID {
 		_, err := uuid.Parse(vid)
 		if err != nil {
@@ -559,7 +599,7 @@ func (fi FileInfo) IsRemote() bool {
 // IsRemote returns true if this object version's contents are in its remote
 // tier.
 func (oi ObjectInfo) IsRemote() bool {
-	if oi.TransitionStatus != lifecycle.TransitionComplete {
+	if oi.TransitionedObject.Status != lifecycle.TransitionComplete {
 		return false
 	}
 	return !isRestoredObjectOnDisk(oi.UserDefined)
@@ -672,4 +712,21 @@ func isRestoredObjectOnDisk(meta map[string]string) (onDisk bool) {
 		}
 	}
 	return onDisk
+}
+
+// ToLifecycleOpts returns lifecycle.ObjectOpts value for oi.
+func (oi ObjectInfo) ToLifecycleOpts() lifecycle.ObjectOpts {
+	return lifecycle.ObjectOpts{
+		Name:             oi.Name,
+		UserTags:         oi.UserTags,
+		VersionID:        oi.VersionID,
+		ModTime:          oi.ModTime,
+		IsLatest:         oi.IsLatest,
+		NumVersions:      oi.NumVersions,
+		DeleteMarker:     oi.DeleteMarker,
+		SuccessorModTime: oi.SuccessorModTime,
+		RestoreOngoing:   oi.RestoreOngoing,
+		RestoreExpires:   oi.RestoreExpires,
+		TransitionStatus: oi.TransitionedObject.Status,
+	}
 }

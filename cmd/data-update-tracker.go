@@ -46,7 +46,7 @@ const (
 	dataUpdateTrackerQueueSize = 0
 
 	dataUpdateTrackerFilename     = dataUsageBucket + SlashSeparator + ".tracker.bin"
-	dataUpdateTrackerVersion      = 5
+	dataUpdateTrackerVersion      = 7
 	dataUpdateTrackerSaveInterval = 5 * time.Minute
 )
 
@@ -176,9 +176,6 @@ func (d *dataUpdateTracker) latestWithDir(dir string) uint64 {
 		return d.current()
 	}
 	if isReservedOrInvalidBucket(bucket, false) {
-		if d.debug {
-			console.Debugf(dateUpdateTrackerLogPrefix+" isReservedOrInvalidBucket: %v, entry: %v\n", bucket, dir)
-		}
 		return d.current()
 	}
 
@@ -400,7 +397,7 @@ func (d *dataUpdateTracker) deserialize(src io.Reader, newerThan time.Time) erro
 		return err
 	}
 	switch tmp[0] {
-	case 1, 2, 3, 4:
+	case 1, 2, 3, 4, 5, 6:
 		if intDataUpdateTracker.debug {
 			console.Debugln(color.Green("dataUpdateTracker: ") + "deprecated data version, updating.")
 		}
@@ -486,9 +483,6 @@ func (d *dataUpdateTracker) startCollector(ctx context.Context) {
 		}
 
 		if isReservedOrInvalidBucket(bucket, false) {
-			if d.debug {
-				console.Debugf(color.Green("dataUpdateTracker:")+" isReservedOrInvalidBucket: %v, entry: %v\n", bucket, in)
-			}
 			continue
 		}
 		split := splitPathDeterministic(in)
@@ -512,7 +506,6 @@ func (d *dataUpdateTracker) markDirty(bucket, prefix string) {
 	}
 
 	if isReservedOrInvalidBucket(bucket, false) && d.debug {
-		console.Debugf(dateUpdateTrackerLogPrefix+" isReservedOrInvalidBucket: %v, entry: %v\n", bucket, prefix)
 		return
 	}
 	split := splitPathDeterministic(pathJoin(bucket, prefix))

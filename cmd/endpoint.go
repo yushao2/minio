@@ -18,8 +18,6 @@
 package cmd
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -36,11 +34,10 @@ import (
 	"github.com/dustin/go-humanize"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/config"
-	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/mountinfo"
-	xnet "github.com/minio/minio/internal/net"
 	"github.com/minio/pkg/env"
+	xnet "github.com/minio/pkg/net"
 )
 
 // EndpointType - enum for endpoint type.
@@ -245,7 +242,7 @@ func (l *EndpointServerPools) Add(zeps PoolEndpoints) error {
 func (l EndpointServerPools) Localhost() string {
 	for _, ep := range l {
 		for _, endpoint := range ep.Endpoints {
-			if endpoint.IsLocal {
+			if endpoint.IsLocal && endpoint.Host != "" {
 				u := &url.URL{
 					Scheme: endpoint.Scheme,
 					Host:   endpoint.Host,
@@ -254,7 +251,11 @@ func (l EndpointServerPools) Localhost() string {
 			}
 		}
 	}
-	return ""
+	host := globalMinioHost
+	if host == "" {
+		host = sortIPs(localIP4.ToSlice())[0]
+	}
+	return fmt.Sprintf("%s://%s", getURLScheme(globalIsTLS), net.JoinHostPort(host, globalMinioPort))
 }
 
 // LocalDisksPaths returns the disk paths of the local disks
@@ -373,27 +374,6 @@ func (endpoints Endpoints) GetAllStrings() (all []string) {
 	return
 }
 
-func hostResolveToLocalhost(endpoint Endpoint) bool {
-	hostIPs, err := getHostIP(endpoint.Hostname())
-	if err != nil {
-		// Log the message to console about the host resolving
-		reqInfo := (&logger.ReqInfo{}).AppendTags(
-			"host",
-			endpoint.Hostname(),
-		)
-		ctx := logger.SetReqInfo(GlobalContext, reqInfo)
-		logger.LogIf(ctx, err, logger.Application)
-		return false
-	}
-	var loopback int
-	for _, hostIP := range hostIPs.ToSlice() {
-		if net.ParseIP(hostIP).IsLoopback() {
-			loopback++
-		}
-	}
-	return loopback == len(hostIPs)
-}
-
 func (endpoints Endpoints) atleastOneEndpointLocal() bool {
 	for _, endpoint := range endpoints {
 		if endpoint.IsLocal {
@@ -406,7 +386,6 @@ func (endpoints Endpoints) atleastOneEndpointLocal() bool {
 // UpdateIsLocal - resolves the host and discovers the local host.
 func (endpoints Endpoints) UpdateIsLocal(foundPrevLocal bool) error {
 	orchestrated := IsDocker() || IsKubernetes()
-	k8sReplicaSet := IsKubernetesReplicaSet()
 
 	var epsResolved int
 	var foundLocal bool
@@ -439,24 +418,6 @@ func (endpoints Endpoints) UpdateIsLocal(foundPrevLocal bool) error {
 					endpoints[i].Hostname(),
 				)
 
-				if k8sReplicaSet && hostResolveToLocalhost(endpoints[i]) {
-					err := fmt.Errorf("host %s resolves to 127.*, DNS incorrectly configured retrying",
-						endpoints[i])
-					// time elapsed
-					timeElapsed := time.Since(startTime)
-					// log error only if more than 1s elapsed
-					if timeElapsed > time.Second {
-						reqInfo.AppendTags("elapsedTime",
-							humanize.RelTime(startTime,
-								startTime.Add(timeElapsed),
-								"elapsed",
-								""))
-						ctx := logger.SetReqInfo(GlobalContext, reqInfo)
-						logger.LogIf(ctx, err, logger.Application)
-					}
-					continue
-				}
-
 				// return err if not Docker or Kubernetes
 				// We use IsDocker() to check for Docker environment
 				// We use IsKubernetes() to check for Kubernetes environment
@@ -485,36 +446,6 @@ func (endpoints Endpoints) UpdateIsLocal(foundPrevLocal bool) error {
 				} else {
 					resolvedList[i] = true
 					endpoints[i].IsLocal = isLocal
-					if k8sReplicaSet && !endpoints.atleastOneEndpointLocal() && !foundPrevLocal {
-						// In replicated set in k8s deployment, IPs might
-						// get resolved for older IPs, add this code
-						// to ensure that we wait for this server to
-						// participate atleast one disk and be local.
-						//
-						// In special cases for replica set with expanded
-						// pool setups we need to make sure to provide
-						// value of foundPrevLocal from pool1 if we already
-						// found a local setup. Only if we haven't found
-						// previous local we continue to wait to look for
-						// atleast one local.
-						resolvedList[i] = false
-						// time elapsed
-						err := fmt.Errorf("no endpoint is local to this host: %s", endpoints[i])
-						timeElapsed := time.Since(startTime)
-						// log error only if more than 1s elapsed
-						if timeElapsed > time.Second {
-							reqInfo.AppendTags("elapsedTime",
-								humanize.RelTime(startTime,
-									startTime.Add(timeElapsed),
-									"elapsed",
-									"",
-								))
-							ctx := logger.SetReqInfo(GlobalContext,
-								reqInfo)
-							logger.LogIf(ctx, err, logger.Application)
-						}
-						continue
-					}
 					epsResolved++
 					if !foundLocal {
 						foundLocal = isLocal
@@ -805,72 +736,6 @@ func GetProxyEndpointLocalIndex(proxyEps []ProxyEndpoint) int {
 		if pep.IsLocal {
 			return i
 		}
-	}
-	return -1
-}
-
-func httpDo(clnt *http.Client, req *http.Request, f func(*http.Response, error) error) error {
-	ctx, cancel := context.WithTimeout(GlobalContext, 200*time.Millisecond)
-	defer cancel()
-
-	// Run the HTTP request in a goroutine and pass the response to f.
-	c := make(chan error, 1)
-	req = req.WithContext(ctx)
-	go func() { c <- f(clnt.Do(req)) }()
-	select {
-	case <-ctx.Done():
-		<-c // Wait for f to return.
-		return ctx.Err()
-	case err := <-c:
-		return err
-	}
-}
-
-func getOnlineProxyEndpointIdx() int {
-	type reqIndex struct {
-		Request *http.Request
-		Idx     int
-	}
-
-	proxyRequests := make(map[*http.Client]reqIndex, len(globalProxyEndpoints))
-	for i, proxyEp := range globalProxyEndpoints {
-		proxyEp := proxyEp
-		serverURL := &url.URL{
-			Scheme: proxyEp.Scheme,
-			Host:   proxyEp.Host,
-			Path:   pathJoin(healthCheckPathPrefix, healthCheckLivenessPath),
-		}
-
-		req, err := http.NewRequest(http.MethodGet, serverURL.String(), nil)
-		if err != nil {
-			continue
-		}
-
-		proxyRequests[&http.Client{
-			Transport: proxyEp.Transport,
-		}] = reqIndex{
-			Request: req,
-			Idx:     i,
-		}
-	}
-
-	for c, r := range proxyRequests {
-		if err := httpDo(c, r.Request, func(resp *http.Response, err error) error {
-			if err != nil {
-				return err
-			}
-			xhttp.DrainBody(resp.Body)
-			if resp.StatusCode != http.StatusOK {
-				return errors.New(resp.Status)
-			}
-			if v := resp.Header.Get(xhttp.MinIOServerStatus); v == unavailable {
-				return errors.New(v)
-			}
-			return nil
-		}); err != nil {
-			continue
-		}
-		return r.Idx
 	}
 	return -1
 }

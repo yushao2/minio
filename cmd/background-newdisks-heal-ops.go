@@ -48,18 +48,23 @@ const (
 type healingTracker struct {
 	disk StorageAPI `msg:"-"`
 
-	ID            string
-	PoolIndex     int
-	SetIndex      int
-	DiskIndex     int
-	Path          string
-	Endpoint      string
-	Started       time.Time
-	LastUpdate    time.Time
-	ObjectsHealed uint64
-	ObjectsFailed uint64
-	BytesDone     uint64
-	BytesFailed   uint64
+	ID         string
+	PoolIndex  int
+	SetIndex   int
+	DiskIndex  int
+	Path       string
+	Endpoint   string
+	Started    time.Time
+	LastUpdate time.Time
+
+	ObjectsTotalCount uint64
+	ObjectsTotalSize  uint64
+
+	ItemsHealed uint64
+	ItemsFailed uint64
+
+	BytesDone   uint64
+	BytesFailed uint64
 
 	// Last object scanned.
 	Bucket string `json:"-"`
@@ -67,10 +72,10 @@ type healingTracker struct {
 
 	// Numbers when current bucket started healing,
 	// for resuming with correct numbers.
-	ResumeObjectsHealed uint64 `json:"-"`
-	ResumeObjectsFailed uint64 `json:"-"`
-	ResumeBytesDone     uint64 `json:"-"`
-	ResumeBytesFailed   uint64 `json:"-"`
+	ResumeItemsHealed uint64 `json:"-"`
+	ResumeItemsFailed uint64 `json:"-"`
+	ResumeBytesDone   uint64 `json:"-"`
+	ResumeBytesFailed uint64 `json:"-"`
 
 	// Filled on startup/restarts.
 	QueuedBuckets []string
@@ -175,8 +180,8 @@ func (h *healingTracker) isHealed(bucket string) bool {
 
 // resume will reset progress to the numbers at the start of the bucket.
 func (h *healingTracker) resume() {
-	h.ObjectsHealed = h.ResumeObjectsHealed
-	h.ObjectsFailed = h.ResumeObjectsFailed
+	h.ItemsHealed = h.ResumeItemsHealed
+	h.ItemsFailed = h.ResumeItemsFailed
 	h.BytesDone = h.ResumeBytesDone
 	h.BytesFailed = h.ResumeBytesFailed
 }
@@ -184,8 +189,8 @@ func (h *healingTracker) resume() {
 // bucketDone should be called when a bucket is done healing.
 // Adds the bucket to the list of healed buckets and updates resume numbers.
 func (h *healingTracker) bucketDone(bucket string) {
-	h.ResumeObjectsHealed = h.ObjectsHealed
-	h.ResumeObjectsFailed = h.ObjectsFailed
+	h.ResumeItemsHealed = h.ItemsHealed
+	h.ResumeItemsFailed = h.ItemsFailed
 	h.ResumeBytesDone = h.BytesDone
 	h.ResumeBytesFailed = h.BytesFailed
 	h.HealedBuckets = append(h.HealedBuckets, bucket)
@@ -220,22 +225,28 @@ func (h *healingTracker) printTo(writer io.Writer) {
 // toHealingDisk converts the information to madmin.HealingDisk
 func (h *healingTracker) toHealingDisk() madmin.HealingDisk {
 	return madmin.HealingDisk{
-		ID:            h.ID,
-		Endpoint:      h.Endpoint,
-		PoolIndex:     h.PoolIndex,
-		SetIndex:      h.SetIndex,
-		DiskIndex:     h.DiskIndex,
-		Path:          h.Path,
-		Started:       h.Started.UTC(),
-		LastUpdate:    h.LastUpdate.UTC(),
-		ObjectsHealed: h.ObjectsHealed,
-		ObjectsFailed: h.ObjectsFailed,
-		BytesDone:     h.BytesDone,
-		BytesFailed:   h.BytesFailed,
-		Bucket:        h.Bucket,
-		Object:        h.Object,
-		QueuedBuckets: h.QueuedBuckets,
-		HealedBuckets: h.HealedBuckets,
+		ID:                h.ID,
+		Endpoint:          h.Endpoint,
+		PoolIndex:         h.PoolIndex,
+		SetIndex:          h.SetIndex,
+		DiskIndex:         h.DiskIndex,
+		Path:              h.Path,
+		Started:           h.Started.UTC(),
+		LastUpdate:        h.LastUpdate.UTC(),
+		ObjectsTotalCount: h.ObjectsTotalCount,
+		ObjectsTotalSize:  h.ObjectsTotalSize,
+		ItemsHealed:       h.ItemsHealed,
+		ItemsFailed:       h.ItemsFailed,
+		BytesDone:         h.BytesDone,
+		BytesFailed:       h.BytesFailed,
+		Bucket:            h.Bucket,
+		Object:            h.Object,
+		QueuedBuckets:     h.QueuedBuckets,
+		HealedBuckets:     h.HealedBuckets,
+
+		ObjectsHealed: h.ItemsHealed, // Deprecated July 2021
+		ObjectsFailed: h.ItemsFailed, // Deprecated July 2021
+
 	}
 }
 
@@ -297,14 +308,6 @@ func getLocalDisksToHeal() (disksToHeal Endpoints) {
 
 }
 
-func initBackgroundHealing(ctx context.Context, objAPI ObjectLayer) {
-	// Run the background healer
-	globalBackgroundHealRoutine = newHealRoutine()
-	go globalBackgroundHealRoutine.run(ctx, objAPI)
-
-	globalBackgroundHealState.LaunchNewHealSequence(newBgHealSequence(), objAPI)
-}
-
 // monitorLocalDisksAndHeal - ensures that detected new disks are healed
 //  1. Only the concerned erasure set will be listed and healed
 //  2. Only the node hosting the disk is responsible to perform the heal
@@ -326,10 +329,10 @@ func monitorLocalDisksAndHeal(ctx context.Context, z *erasureServerPools, bgSeq 
 			healDisks := globalBackgroundHealState.getHealLocalDiskEndpoints()
 			if len(healDisks) > 0 {
 				// Reformat disks
-				bgSeq.sourceCh <- healSource{bucket: SlashSeparator}
+				bgSeq.queueHealTask(healSource{bucket: SlashSeparator}, madmin.HealItemMetadata)
 
 				// Ensure that reformatting disks is finished
-				bgSeq.sourceCh <- healSource{bucket: nopHeal}
+				bgSeq.queueHealTask(healSource{bucket: nopHeal}, madmin.HealItemMetadata)
 
 				logger.Info(fmt.Sprintf("Found drives to heal %d, proceeding to heal content...",
 					len(healDisks)))
@@ -340,7 +343,7 @@ func monitorLocalDisksAndHeal(ctx context.Context, z *erasureServerPools, bgSeq 
 				}
 			}
 
-			if serverDebugLog {
+			if serverDebugLog && len(healDisks) > 0 {
 				console.Debugf(color.Green("healDisk:")+" disk check timer fired, attempting to heal %d drives\n", len(healDisks))
 			}
 
@@ -411,6 +414,14 @@ func monitorLocalDisksAndHeal(ctx context.Context, z *erasureServerPools, bgSeq 
 							if err != nil {
 								logger.Info("Healing tracker missing on '%s', disk was swapped again on %s pool", disk, humanize.Ordinal(i+1))
 								tracker = newHealingTracker(disk)
+							}
+
+							// Load bucket totals
+							cache := dataUsageCache{}
+							if err := cache.load(ctx, z.serverPools[i].sets[setIndex], dataUsageCacheName); err == nil {
+								dataUsageInfo := cache.dui(dataUsageRoot, nil)
+								tracker.ObjectsTotalCount = dataUsageInfo.ObjectsTotalCount
+								tracker.ObjectsTotalSize = dataUsageInfo.ObjectsTotalSize
 							}
 
 							tracker.PoolIndex, tracker.SetIndex, tracker.DiskIndex = disk.GetDiskLoc()

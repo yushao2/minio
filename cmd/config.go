@@ -20,6 +20,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path"
 	"sort"
 	"strings"
@@ -95,7 +96,9 @@ func listServerConfigHistory(ctx context.Context, objAPI ObjectLayer, withData b
 
 func delServerConfigHistory(ctx context.Context, objAPI ObjectLayer, uuidKV string) error {
 	historyFile := pathJoin(minioConfigHistoryPrefix, uuidKV+kvPrefix)
-	_, err := objAPI.DeleteObject(ctx, minioMetaBucket, historyFile, ObjectOptions{})
+	_, err := objAPI.DeleteObject(ctx, minioMetaBucket, historyFile, ObjectOptions{
+		DeletePrefix: true,
+	})
 	return err
 }
 
@@ -149,13 +152,13 @@ func saveServerConfig(ctx context.Context, objAPI ObjectLayer, cfg interface{}) 
 }
 
 func readServerConfig(ctx context.Context, objAPI ObjectLayer) (config.Config, error) {
+	var srvCfg = config.New()
 	configFile := path.Join(minioConfigPrefix, minioConfigFile)
 	data, err := readConfig(ctx, objAPI, configFile)
 	if err != nil {
-		// Config not found for some reason, allow things to continue
-		// by initializing a new fresh config in safe mode.
-		if err == errConfigNotFound && newObjectLayerFn() == nil {
-			return newServerConfig(), nil
+		if errors.Is(err, errConfigNotFound) {
+			lookupConfigs(srvCfg, objAPI)
+			return srvCfg, nil
 		}
 		return nil, err
 	}
@@ -165,11 +168,11 @@ func readServerConfig(ctx context.Context, objAPI ObjectLayer) (config.Config, e
 			minioMetaBucket: path.Join(minioMetaBucket, configFile),
 		})
 		if err != nil {
+			lookupConfigs(srvCfg, objAPI)
 			return nil, err
 		}
 	}
 
-	var srvCfg = config.New()
 	var json = jsoniter.ConfigCompatibleWithStandardLibrary
 	if err = json.Unmarshal(data, &srvCfg); err != nil {
 		return nil, err

@@ -1,3 +1,4 @@
+//go:build windows
 // +build windows
 
 // Copyright (c) 2015-2021 MinIO, Inc.
@@ -28,11 +29,6 @@ import (
 func access(name string) error {
 	_, err := os.Lstat(name)
 	return err
-}
-
-// Return all the entries at the directory dirPath.
-func readDir(dirPath string) (entries []string, err error) {
-	return readDirN(dirPath, -1)
 }
 
 // readDirFn applies the fn() function on each entries at dirPath, doesn't recurse into
@@ -118,8 +114,8 @@ func readDirFn(dirPath string, filter func(name string, typ os.FileMode) error) 
 	return nil
 }
 
-// Return N entries at the directory dirPath. If count is -1, return all entries
-func readDirN(dirPath string, count int) (entries []string, err error) {
+// Return N entries at the directory dirPath.
+func readDirWithOpts(dirPath string, opts readDirOpts) (entries []string, err error) {
 	f, err := os.Open(dirPath)
 	if err != nil {
 		return nil, osErrToFileErr(err)
@@ -138,6 +134,7 @@ func readDirN(dirPath string, count int) (entries []string, err error) {
 	data := &syscall.Win32finddata{}
 	handle := syscall.Handle(f.Fd())
 
+	count := opts.count
 	for count != 0 {
 		e := syscall.FindNextFile(handle, data)
 		if e != nil {
@@ -172,7 +169,7 @@ func readDirN(dirPath string, count int) (entries []string, err error) {
 				return nil, err
 			}
 
-			if fi.IsDir() {
+			if !opts.followDirSymlink && fi.IsDir() {
 				// directory symlinks are ignored.
 				continue
 			}

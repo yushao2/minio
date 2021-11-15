@@ -28,7 +28,7 @@ import (
 	"strings"
 	"time"
 
-	jwtgo "github.com/dgrijalva/jwt-go"
+	jwtgo "github.com/golang-jwt/jwt/v4"
 	"github.com/minio/minio/internal/jwt"
 )
 
@@ -94,13 +94,14 @@ const (
 
 // Credentials holds access and secret keys.
 type Credentials struct {
-	AccessKey    string    `xml:"AccessKeyId" json:"accessKey,omitempty"`
-	SecretKey    string    `xml:"SecretAccessKey" json:"secretKey,omitempty"`
-	Expiration   time.Time `xml:"Expiration" json:"expiration,omitempty"`
-	SessionToken string    `xml:"SessionToken" json:"sessionToken,omitempty"`
-	Status       string    `xml:"-" json:"status,omitempty"`
-	ParentUser   string    `xml:"-" json:"parentUser,omitempty"`
-	Groups       []string  `xml:"-" json:"groups,omitempty"`
+	AccessKey    string                 `xml:"AccessKeyId" json:"accessKey,omitempty"`
+	SecretKey    string                 `xml:"SecretAccessKey" json:"secretKey,omitempty"`
+	Expiration   time.Time              `xml:"Expiration" json:"expiration,omitempty"`
+	SessionToken string                 `xml:"SessionToken" json:"sessionToken,omitempty"`
+	Status       string                 `xml:"-" json:"status,omitempty"`
+	ParentUser   string                 `xml:"-" json:"parentUser,omitempty"`
+	Groups       []string               `xml:"-" json:"groups,omitempty"`
+	Claims       map[string]interface{} `xml:"-" json:"claims,omitempty"`
 }
 
 func (cred Credentials) String() string {
@@ -191,8 +192,9 @@ func ExpToInt64(expI interface{}) (expAt int64, err error) {
 	return expAt, err
 }
 
-// GetNewCredentialsWithMetadata generates and returns new credential with expiry.
-func GetNewCredentialsWithMetadata(m map[string]interface{}, tokenSecret string) (cred Credentials, err error) {
+// GenerateCredentials - creates randomly generated credentials of maximum
+// allowed length.
+func GenerateCredentials() (accessKey, secretKey string, err error) {
 	readBytes := func(size int) (data []byte, err error) {
 		data = make([]byte, size)
 		var n int
@@ -207,22 +209,31 @@ func GetNewCredentialsWithMetadata(m map[string]interface{}, tokenSecret string)
 	// Generate access key.
 	keyBytes, err := readBytes(accessKeyMaxLen)
 	if err != nil {
-		return cred, err
+		return "", "", err
 	}
 	for i := 0; i < accessKeyMaxLen; i++ {
 		keyBytes[i] = alphaNumericTable[keyBytes[i]%alphaNumericTableLen]
 	}
-	accessKey := string(keyBytes)
+	accessKey = string(keyBytes)
 
 	// Generate secret key.
 	keyBytes, err = readBytes(secretKeyMaxLen)
 	if err != nil {
-		return cred, err
+		return "", "", err
 	}
 
-	secretKey := strings.Replace(string([]byte(base64.StdEncoding.EncodeToString(keyBytes))[:secretKeyMaxLen]),
+	secretKey = strings.Replace(string([]byte(base64.StdEncoding.EncodeToString(keyBytes))[:secretKeyMaxLen]),
 		"/", "+", -1)
 
+	return accessKey, secretKey, nil
+}
+
+// GetNewCredentialsWithMetadata generates and returns new credential with expiry.
+func GetNewCredentialsWithMetadata(m map[string]interface{}, tokenSecret string) (Credentials, error) {
+	accessKey, secretKey, err := GenerateCredentials()
+	if err != nil {
+		return Credentials{}, err
+	}
 	return CreateNewCredentialsWithMetadata(accessKey, secretKey, m, tokenSecret)
 }
 

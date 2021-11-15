@@ -17,39 +17,90 @@
 
 package logger
 
+import (
+	"sync"
+	"sync/atomic"
+)
+
 // Target is the entity that we will receive
 // a single log entry and Send it to the log target
 //   e.g. Send the log to a http server
 type Target interface {
 	String() string
 	Endpoint() string
-	Validate() error
+	Init() error
 	Send(entry interface{}, errKind string) error
 }
 
-// Targets is the set of enabled loggers
-var Targets = []Target{}
+// swapMu must be held while reading slice info or swapping targets or auditTargets.
+var swapMu sync.Mutex
 
-// AuditTargets is the list of enabled audit loggers
-var AuditTargets = []Target{}
+// targets is the set of enabled loggers.
+// Must be immutable at all times.
+// Can be swapped to another while holding swapMu
+var targets = []Target{}
+var nTargets int32 // atomic count of len(targets)
+
+// Targets returns active targets.
+// Returned slice may not be modified in any way.
+func Targets() []Target {
+	if atomic.LoadInt32(&nTargets) == 0 {
+		// Lock free if none...
+		return nil
+	}
+	swapMu.Lock()
+	res := targets
+	swapMu.Unlock()
+	return res
+}
+
+// AuditTargets returns active audit targets.
+// Returned slice may not be modified in any way.
+func AuditTargets() []Target {
+	if atomic.LoadInt32(&nAuditTargets) == 0 {
+		// Lock free if none...
+		return nil
+	}
+	swapMu.Lock()
+	res := auditTargets
+	swapMu.Unlock()
+	return res
+}
+
+// auditTargets is the list of enabled audit loggers
+// Must be immutable at all times.
+// Can be swapped to another while holding swapMu
+var auditTargets = []Target{}
+var nAuditTargets int32 // atomic count of len(auditTargets)
 
 // AddAuditTarget adds a new audit logger target to the
 // list of enabled loggers
 func AddAuditTarget(t Target) error {
-	if err := t.Validate(); err != nil {
+	if err := t.Init(); err != nil {
 		return err
 	}
 
-	AuditTargets = append(AuditTargets, t)
+	swapMu.Lock()
+	updated := append(make([]Target, 0, len(auditTargets)+1), auditTargets...)
+	updated = append(updated, t)
+	auditTargets = updated
+	atomic.StoreInt32(&nAuditTargets, int32(len(updated)))
+	swapMu.Unlock()
 	return nil
 }
 
 // AddTarget adds a new logger target to the
 // list of enabled loggers
 func AddTarget(t Target) error {
-	if err := t.Validate(); err != nil {
+	if err := t.Init(); err != nil {
 		return err
 	}
-	Targets = append(Targets, t)
+	swapMu.Lock()
+	updated := append(make([]Target, 0, len(targets)+1), targets...)
+	updated = append(updated, t)
+	targets = updated
+	atomic.StoreInt32(&nTargets, int32(len(updated)))
+	swapMu.Unlock()
+
 	return nil
 }

@@ -32,13 +32,15 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/minio/minio/internal/event"
-	xnet "github.com/minio/minio/internal/net"
+	xnet "github.com/minio/pkg/net"
 )
 
 const (
 	mysqlTableExists          = `SELECT 1 FROM %s;`
-	mysqlCreateNamespaceTable = `CREATE TABLE %s (key_name VARCHAR(2048), value JSON, PRIMARY KEY (key_name));`
-	mysqlCreateAccessTable    = `CREATE TABLE %s (event_time DATETIME NOT NULL, event_data JSON);`
+	mysqlCreateNamespaceTable = `CREATE TABLE %s (key_name VARCHAR(4096), value JSON, PRIMARY KEY (key_name))
+                                       CHARACTER SET = utf8mb4 COLLATE = utf8mb4_bin ROW_FORMAT = Dynamic;`
+	mysqlCreateAccessTable = `CREATE TABLE %s (event_time DATETIME NOT NULL, event_data JSON)
+                                    ROW_FORMAT = Dynamic;`
 
 	mysqlUpdateRow = `INSERT INTO %s (key_name, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value=VALUES(value);`
 	mysqlDeleteRow = `DELETE FROM %s WHERE key_name = ?;`

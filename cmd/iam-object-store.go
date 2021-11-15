@@ -22,7 +22,6 @@ import (
 	"path"
 	"strings"
 	"sync"
-	"time"
 	"unicode/utf8"
 
 	jsoniter "github.com/json-iterator/go"
@@ -35,30 +34,44 @@ import (
 
 // IAMObjectStore implements IAMStorageAPI
 type IAMObjectStore struct {
-	// Protect assignment to objAPI
+	// Protect access to storage within the current server.
 	sync.RWMutex
+
+	*iamCache
+
+	usersSysType UsersSysType
 
 	objAPI ObjectLayer
 }
 
-func newIAMObjectStore(objAPI ObjectLayer) *IAMObjectStore {
-	return &IAMObjectStore{objAPI: objAPI}
+func newIAMObjectStore(objAPI ObjectLayer, usersSysType UsersSysType) *IAMObjectStore {
+	return &IAMObjectStore{
+		iamCache:     newIamCache(),
+		objAPI:       objAPI,
+		usersSysType: usersSysType,
+	}
 }
 
-func (iamOS *IAMObjectStore) lock() {
+func (iamOS *IAMObjectStore) rlock() *iamCache {
+	iamOS.RLock()
+	return iamOS.iamCache
+}
+
+func (iamOS *IAMObjectStore) runlock() {
+	iamOS.RUnlock()
+}
+
+func (iamOS *IAMObjectStore) lock() *iamCache {
 	iamOS.Lock()
+	return iamOS.iamCache
 }
 
 func (iamOS *IAMObjectStore) unlock() {
 	iamOS.Unlock()
 }
 
-func (iamOS *IAMObjectStore) rlock() {
-	iamOS.RLock()
-}
-
-func (iamOS *IAMObjectStore) runlock() {
-	iamOS.RUnlock()
+func (iamOS *IAMObjectStore) getUsersSysType() UsersSysType {
+	return iamOS.usersSysType
 }
 
 // Migrate users directory in a single scan.
@@ -104,7 +117,7 @@ func (iamOS *IAMObjectStore) migrateUsersConfigToV1(ctx context.Context) error {
 
 			// 2. copy policy file to new location.
 			mp := newMappedPolicy(policyName)
-			userType := regularUser
+			userType := regUser
 			if err := iamOS.saveMappedPolicy(ctx, user, userType, false, mp); err != nil {
 				return err
 			}
@@ -183,6 +196,8 @@ func (iamOS *IAMObjectStore) migrateToV1(ctx context.Context) error {
 
 // Should be called under config migration lock
 func (iamOS *IAMObjectStore) migrateBackendFormat(ctx context.Context) error {
+	iamOS.Lock()
+	defer iamOS.Unlock()
 	return iamOS.migrateToV1(ctx)
 }
 
@@ -279,7 +294,7 @@ func (iamOS *IAMObjectStore) loadUser(ctx context.Context, user string, userType
 func (iamOS *IAMObjectStore) loadUsers(ctx context.Context, userType IAMUserType, m map[string]auth.Credentials) error {
 	var basePrefix string
 	switch userType {
-	case srvAccUser:
+	case svcUser:
 		basePrefix = iamConfigServiceAccountsPrefix
 	case stsUser:
 		basePrefix = iamConfigSTSPrefix
@@ -348,7 +363,7 @@ func (iamOS *IAMObjectStore) loadMappedPolicies(ctx context.Context, userType IA
 		basePath = iamConfigPolicyDBGroupsPrefix
 	} else {
 		switch userType {
-		case srvAccUser:
+		case svcUser:
 			basePath = iamConfigPolicyDBServiceAccountsPrefix
 		case stsUser:
 			basePath = iamConfigPolicyDBSTSUsersPrefix
@@ -368,11 +383,6 @@ func (iamOS *IAMObjectStore) loadMappedPolicies(ctx context.Context, userType IA
 		}
 	}
 	return nil
-}
-
-// Refresh IAMSys. If an object layer is passed in use that, otherwise load from global.
-func (iamOS *IAMObjectStore) loadAll(ctx context.Context, sys *IAMSys) error {
-	return sys.Load(ctx, iamOS)
 }
 
 func (iamOS *IAMObjectStore) savePolicyDoc(ctx context.Context, policyName string, p iampolicy.Policy) error {
@@ -462,14 +472,4 @@ func listIAMConfigItems(ctx context.Context, objAPI ObjectLayer, pathPrefix stri
 	}()
 
 	return ch
-}
-
-func (iamOS *IAMObjectStore) watch(ctx context.Context, sys *IAMSys) {
-	// Refresh IAMSys.
-	for {
-		time.Sleep(globalRefreshIAMInterval)
-		if err := iamOS.loadAll(ctx, sys); err != nil {
-			logger.LogIf(ctx, err)
-		}
-	}
 }

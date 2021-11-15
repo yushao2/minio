@@ -84,6 +84,11 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		{testBuckets[4], "file1/guidSplunk-aaaa/file", "content", nil},
 		{testBuckets[5], "dir/day_id=2017-10-10/issue", "content", nil},
 		{testBuckets[5], "dir/day_id=2017-10-11/issue", "content", nil},
+		{testBuckets[5], "foo/201910/1122", "content", nil},
+		{testBuckets[5], "foo/201910/1112", "content", nil},
+		{testBuckets[5], "foo/201910/2112", "content", nil},
+		{testBuckets[5], "foo/201910_txt", "content", nil},
+		{testBuckets[5], "201910/foo/bar/xl.meta/1.txt", "content", nil},
 	}
 	for _, object := range testObjects {
 		md5Bytes := md5.Sum([]byte(object.content))
@@ -477,6 +482,31 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 			IsTruncated: true,
 			Prefixes:    []string{"dir/day_id=2017-10-10/"},
 		},
+		// ListObjectsResult-37 list with prefix match 2 levels deep
+		{
+			IsTruncated: false,
+			Objects: []ObjectInfo{
+				{Name: "foo/201910/1112"},
+				{Name: "foo/201910/1122"},
+			},
+		},
+		// ListObjectsResult-38 list with prefix match 1 level deep
+		{
+			IsTruncated: false,
+			Objects: []ObjectInfo{
+				{Name: "foo/201910/1112"},
+				{Name: "foo/201910/1122"},
+				{Name: "foo/201910/2112"},
+				{Name: "foo/201910_txt"},
+			},
+		},
+		// ListObjectsResult-39 list with prefix match 1 level deep
+		{
+			IsTruncated: false,
+			Objects: []ObjectInfo{
+				{Name: "201910/foo/bar/xl.meta/1.txt"},
+			},
+		},
 	}
 
 	testCases := []struct {
@@ -602,6 +632,11 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		{testBuckets[4], "file1/", "", "guidSplunk", 1000, resultCases[35], nil, true},
 		// Test listing at prefix with expected prefix markers
 		{testBuckets[5], "dir/", "", SlashSeparator, 1, resultCases[36], nil, true},
+		// Test listing with prefix match
+		{testBuckets[5], "foo/201910/11", "", "", 1000, resultCases[37], nil, true},
+		{testBuckets[5], "foo/201910", "", "", 1000, resultCases[38], nil, true},
+		// Test listing with prefix match with 'xl.meta'
+		{testBuckets[5], "201910/foo/bar", "", "", 1000, resultCases[39], nil, true},
 	}
 
 	for i, testCase := range testCases {
@@ -644,11 +679,6 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 					if testCase.result.Objects[j].Name != result.Objects[j].Name {
 						t.Errorf("Test %d: %s: Expected object name to be \"%s\", but found \"%s\" instead", i+1, instanceType, testCase.result.Objects[j].Name, result.Objects[j].Name)
 					}
-					// FIXME: we should always check for ETag
-					if result.Objects[j].ETag == "" && !strings.HasSuffix(result.Objects[j].Name, SlashSeparator) {
-						t.Errorf("Test %d: %s: Expected ETag to be not empty, but found empty instead (%v)", i+1, instanceType, result.Objects[j].Name)
-					}
-
 				}
 
 				if len(testCase.result.Prefixes) != len(result.Prefixes) {
@@ -1315,11 +1345,6 @@ func testListObjectVersions(obj ObjectLayer, instanceType string, t1 TestErrHand
 					if testCase.result.Objects[j].Name != result.Objects[j].Name {
 						t.Errorf("%s: Expected object name to be \"%s\", but found \"%s\" instead", instanceType, testCase.result.Objects[j].Name, result.Objects[j].Name)
 					}
-					// FIXME: we should always check for ETag
-					if result.Objects[j].ETag == "" && !strings.HasSuffix(result.Objects[j].Name, SlashSeparator) {
-						t.Errorf("%s: Expected ETag to be not empty, but found empty instead (%v)", instanceType, result.Objects[j].Name)
-					}
-
 				}
 
 				if len(testCase.result.Prefixes) != len(result.Prefixes) {
@@ -1353,6 +1378,152 @@ func testListObjectVersions(obj ObjectLayer, instanceType string, t1 TestErrHand
 	}
 }
 
+// Wrapper for calling ListObjects continuation tests for both Erasure multiple disks and single node setup.
+func TestListObjectsContinuation(t *testing.T) {
+	ExecObjectLayerTest(t, testListObjectsContinuation)
+}
+
+// Unit test for ListObjects in general.
+func testListObjectsContinuation(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
+	t, _ := t1.(*testing.T)
+	testBuckets := []string{
+		// This bucket is used for testing ListObject operations.
+		"test-bucket-list-object-continuation-1",
+		"test-bucket-list-object-continuation-2",
+	}
+	for _, bucket := range testBuckets {
+		err := obj.MakeBucketWithLocation(context.Background(), bucket, BucketOptions{})
+		if err != nil {
+			t.Fatalf("%s : %s", instanceType, err.Error())
+		}
+	}
+
+	var err error
+	testObjects := []struct {
+		parentBucket string
+		name         string
+		content      string
+		meta         map[string]string
+	}{
+		{testBuckets[0], "a/1.txt", "contentstring", nil},
+		{testBuckets[0], "a-1.txt", "contentstring", nil},
+		{testBuckets[0], "a.txt", "contentstring", nil},
+		{testBuckets[0], "apache2-doc/1.txt", "contentstring", nil},
+		{testBuckets[0], "apache2/1.txt", "contentstring", nil},
+		{testBuckets[0], "apache2/-sub/2.txt", "contentstring", nil},
+		{testBuckets[1], "azerty/1.txt", "contentstring", nil},
+		{testBuckets[1], "apache2-doc/1.txt", "contentstring", nil},
+		{testBuckets[1], "apache2/1.txt", "contentstring", nil},
+	}
+	for _, object := range testObjects {
+		md5Bytes := md5.Sum([]byte(object.content))
+		_, err = obj.PutObject(context.Background(), object.parentBucket, object.name, mustGetPutObjReader(t, bytes.NewBufferString(object.content),
+			int64(len(object.content)), hex.EncodeToString(md5Bytes[:]), ""), ObjectOptions{UserDefined: object.meta})
+		if err != nil {
+			t.Fatalf("%s : %s", instanceType, err.Error())
+		}
+
+	}
+
+	// Formualting the result data set to be expected from ListObjects call inside the tests,
+	// This will be used in testCases and used for asserting the correctness of ListObjects output in the tests.
+
+	resultCases := []ListObjectsInfo{
+		{
+			Objects: []ObjectInfo{
+				{Name: "a-1.txt"},
+				{Name: "a.txt"},
+				{Name: "a/1.txt"},
+				{Name: "apache2-doc/1.txt"},
+				{Name: "apache2/-sub/2.txt"},
+				{Name: "apache2/1.txt"},
+			},
+		},
+		{
+			Objects: []ObjectInfo{
+				{Name: "apache2-doc/1.txt"},
+				{Name: "apache2/1.txt"},
+			},
+		},
+		{
+			Prefixes: []string{"apache2-doc/", "apache2/", "azerty/"},
+		},
+	}
+
+	testCases := []struct {
+		// Inputs to ListObjects.
+		bucketName string
+		prefix     string
+		delimiter  string
+		page       int
+		// Expected output of ListObjects.
+		result ListObjectsInfo
+	}{
+		{testBuckets[0], "", "", 1, resultCases[0]},
+		{testBuckets[0], "a", "", 1, resultCases[0]},
+		{testBuckets[1], "apache", "", 1, resultCases[1]},
+		{testBuckets[1], "", "/", 1, resultCases[2]},
+	}
+
+	for i, testCase := range testCases {
+		testCase := testCase
+		t.Run(fmt.Sprintf("%s-Test%d", instanceType, i+1), func(t *testing.T) {
+			var foundObjects []ObjectInfo
+			var foundPrefixes []string
+			var marker = ""
+			for {
+				result, err := obj.ListObjects(context.Background(), testCase.bucketName,
+					testCase.prefix, marker, testCase.delimiter, testCase.page)
+				if err != nil {
+					t.Fatalf("Test %d: %s: Expected to pass, but failed with: <ERROR> %s", i+1, instanceType, err.Error())
+				}
+				foundObjects = append(foundObjects, result.Objects...)
+				foundPrefixes = append(foundPrefixes, result.Prefixes...)
+				if !result.IsTruncated {
+					break
+				}
+				marker = result.NextMarker
+				if len(result.Objects) > 0 {
+					// Discard marker, so it cannot resume listing.
+					marker = result.Objects[len(result.Objects)-1].Name
+				}
+			}
+
+			if len(testCase.result.Objects) != len(foundObjects) {
+				t.Logf("want: %v", objInfoNames(testCase.result.Objects))
+				t.Logf("got: %v", objInfoNames(foundObjects))
+				t.Errorf("Test %d: %s: Expected number of objects in the result to be '%d', but found '%d' objects instead",
+					i+1, instanceType, len(testCase.result.Objects), len(foundObjects))
+			}
+			for j := 0; j < len(testCase.result.Objects); j++ {
+				if j >= len(foundObjects) {
+					t.Errorf("Test %d: %s: Expected object name to be \"%s\", but not nothing instead", i+1, instanceType, testCase.result.Objects[j].Name)
+					continue
+				}
+				if testCase.result.Objects[j].Name != foundObjects[j].Name {
+					t.Errorf("Test %d: %s: Expected object name to be \"%s\", but found \"%s\" instead", i+1, instanceType, testCase.result.Objects[j].Name, foundObjects[j].Name)
+				}
+			}
+
+			if len(testCase.result.Prefixes) != len(foundPrefixes) {
+				t.Logf("want: %v", testCase.result.Prefixes)
+				t.Logf("got: %v", foundPrefixes)
+				t.Errorf("Test %d: %s: Expected number of prefixes in the result to be '%d', but found '%d' prefixes instead",
+					i+1, instanceType, len(testCase.result.Prefixes), len(foundPrefixes))
+			}
+			for j := 0; j < len(testCase.result.Prefixes); j++ {
+				if j >= len(foundPrefixes) {
+					t.Errorf("Test %d: %s: Expected prefix name to be \"%s\", but found no result", i+1, instanceType, testCase.result.Prefixes[j])
+					continue
+				}
+				if testCase.result.Prefixes[j] != foundPrefixes[j] {
+					t.Errorf("Test %d: %s: Expected prefix name to be \"%s\", but found \"%s\" instead", i+1, instanceType, testCase.result.Prefixes[j], foundPrefixes[j])
+				}
+			}
+		})
+	}
+}
+
 // Initialize FS backend for the benchmark.
 func initFSObjectsB(disk string, t *testing.B) (obj ObjectLayer) {
 	var err error
@@ -1360,6 +1531,11 @@ func initFSObjectsB(disk string, t *testing.B) (obj ObjectLayer) {
 	if err != nil {
 		t.Fatal("Unexpected err: ", err)
 	}
+
+	newTestConfig(globalMinioDefaultRegion, obj)
+
+	newAllSubsystems()
+
 	return obj
 }
 

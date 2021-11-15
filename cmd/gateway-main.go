@@ -29,7 +29,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/minio/cli"
-	"github.com/minio/minio/internal/color"
+	"github.com/minio/madmin-go"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/certs"
@@ -154,8 +154,11 @@ func ValidateGatewayArguments(serverAddr, endpointAddr string) error {
 
 // StartGateway - handler for 'minio gateway <name>'.
 func StartGateway(ctx *cli.Context, gw Gateway) {
-	defer globalDNSCache.Stop()
+	signal.Notify(globalOSSignalCh, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
 
+	go handleSignals()
+
+	signal.Notify(globalOSSignalCh, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
 	// This is only to uniquely identify each gateway deployments.
 	globalDeploymentID = env.Get("MINIO_GATEWAY_DEPLOYMENT_ID", mustGetUUID())
 	logger.SetDeploymentID(globalDeploymentID)
@@ -198,22 +201,11 @@ func StartGateway(ctx *cli.Context, gw Gateway) {
 	// Initialize all help
 	initHelp()
 
-	// Get port to listen on from gateway address
-	globalMinioHost, globalMinioPort = mustSplitHostPort(globalCLIContext.Addr)
-
 	// On macOS, if a process already listens on LOCALIPADDR:PORT, net.Listen() falls back
 	// to IPv6 address ie minio will start listening on IPv6 address whereas another
 	// (non-)minio process is listening on IPv4 of given port.
 	// To avoid this error situation we check for port availability.
 	logger.FatalIf(checkPortAvailability(globalMinioHost, globalMinioPort), "Unable to start the gateway")
-
-	globalMinioEndpoint = func() string {
-		host := globalMinioHost
-		if host == "" {
-			host = sortIPs(localIP4.ToSlice())[0]
-		}
-		return fmt.Sprintf("%s://%s", getURLScheme(globalIsTLS), net.JoinHostPort(host, globalMinioPort))
-	}()
 
 	// Handle gateway specific env
 	gatewayHandleEnvVars()
@@ -223,8 +215,6 @@ func StartGateway(ctx *cli.Context, gw Gateway) {
 
 	// Set when gateway is enabled
 	globalIsGateway = true
-
-	enableConfigOps := false
 
 	// TODO: We need to move this code with globalConfigSys.Init()
 	// for now keep it here such that "s3" gateway layer initializes
@@ -246,27 +236,18 @@ func StartGateway(ctx *cli.Context, gw Gateway) {
 	// avoid URL path encoding minio/minio#8950
 	router := mux.NewRouter().SkipClean(true).UseEncodedPath()
 
-	if globalEtcdClient != nil {
-		// Enable STS router if etcd is enabled.
-		registerSTSRouter(router)
-	}
-
-	enableIAMOps := globalEtcdClient != nil
+	// Enable STS router if etcd is enabled.
+	registerSTSRouter(router)
 
 	// Enable IAM admin APIs if etcd is enabled, if not just enable basic
 	// operations such as profiling, server info etc.
-	registerAdminRouter(router, enableConfigOps, enableIAMOps)
+	registerAdminRouter(router, false)
 
 	// Add healthcheck router
 	registerHealthCheckRouter(router)
 
 	// Add server metrics router
 	registerMetricsRouter(router)
-
-	// Register web router when its enabled.
-	if globalBrowserEnabled {
-		logger.FatalIf(registerWebRouter(router), "Unable to configure web browser")
-	}
 
 	// Add API router.
 	registerAPIRouter(router)
@@ -279,24 +260,32 @@ func StartGateway(ctx *cli.Context, gw Gateway) {
 		getCert = globalTLSCerts.GetCertificate
 	}
 
-	httpServer := xhttp.NewServer([]string{globalCLIContext.Addr},
-		criticalErrorHandler{corsHandler(router)}, getCert)
+	listeners := ctx.Int("listeners")
+	if listeners == 0 {
+		listeners = 1
+	}
+	addrs := make([]string, 0, listeners)
+	for i := 0; i < listeners; i++ {
+		addrs = append(addrs, globalMinioAddr)
+	}
+
+	httpServer := xhttp.NewServer(addrs, setCriticalErrorHandler(corsHandler(router)), getCert)
 	httpServer.BaseContext = func(listener net.Listener) context.Context {
 		return GlobalContext
 	}
 	go func() {
-		globalHTTPServerErrorCh <- httpServer.Start()
+		globalHTTPServerErrorCh <- httpServer.Start(GlobalContext)
 	}()
 
 	globalObjLayerMutex.Lock()
 	globalHTTPServer = httpServer
 	globalObjLayerMutex.Unlock()
 
-	signal.Notify(globalOSSignalCh, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
-
-	newObject, err := gw.NewGatewayLayer(globalActiveCred)
+	newObject, err := gw.NewGatewayLayer(madmin.Credentials{
+		AccessKey: globalActiveCred.AccessKey,
+		SecretKey: globalActiveCred.SecretKey,
+	})
 	if err != nil {
-		globalHTTPServer.Shutdown()
 		logger.FatalIf(err, "Unable to initialize gateway backend")
 	}
 	newObject = NewGatewayLayerWithLocker(newObject)
@@ -317,12 +306,7 @@ func StartGateway(ctx *cli.Context, gw Gateway) {
 		logger.FatalIf(globalNotificationSys.Init(GlobalContext, buckets, newObject), "Unable to initialize notification system")
 	}
 
-	if enableIAMOps {
-		// Initialize users credentials and policies in background.
-		globalIAMSys.InitStore(newObject)
-
-		go globalIAMSys.Init(GlobalContext, newObject)
-	}
+	go globalIAMSys.Init(GlobalContext, newObject, globalEtcdClient, globalRefreshIAMInterval)
 
 	if globalCacheConfig.Enabled {
 		// initialize the new disk cache objects.
@@ -350,19 +334,25 @@ func StartGateway(ctx *cli.Context, gw Gateway) {
 	verifyObjectLayerFeatures("gateway "+gatewayName, newObject)
 
 	// Prints the formatted startup message once object layer is initialized.
-	if !globalCLIContext.Quiet {
-		mode := globalMinioModeGatewayPrefix + gatewayName
+	if !globalCLIContext.Quiet && !globalInplaceUpdateDisabled {
 		// Check update mode.
-		checkUpdate(mode)
+		checkUpdate(globalMinioModeGatewayPrefix + gatewayName)
+	}
 
-		// Print a warning message if gateway is not ready for production before the startup banner.
-		if !gw.Production() {
-			logStartupMessage(color.Yellow("               *** Warning: Not Ready for Production ***"))
-		}
-
+	if !globalCLIContext.Quiet {
 		// Print gateway startup message.
 		printGatewayStartupMessage(getAPIEndpoints(), gatewayName)
 	}
 
-	handleSignals()
+	if globalBrowserEnabled {
+		globalConsoleSrv, err = initConsoleServer()
+		if err != nil {
+			logger.FatalIf(err, "Unable to initialize console service")
+		}
+
+		go func() {
+			logger.FatalIf(globalConsoleSrv.Serve(), "Unable to initialize console server")
+		}()
+	}
+	<-globalOSSignalCh
 }

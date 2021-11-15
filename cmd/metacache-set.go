@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"strconv"
 	"strings"
 	"sync"
@@ -82,13 +83,6 @@ type listPathOptions struct {
 	// Create indicates that the lister should not attempt to load an existing cache.
 	Create bool
 
-	// CurrentCycle indicates the current bloom cycle.
-	// Will be used if a new scan is started.
-	CurrentCycle uint64
-
-	// OldestCycle indicates the oldest cycle acceptable.
-	OldestCycle uint64
-
 	// Include pure directories.
 	IncludeDirectories bool
 
@@ -97,9 +91,8 @@ type listPathOptions struct {
 	// A transient result will never be returned from the cache so knowing the list id is required.
 	Transient bool
 
-	// discardResult will not persist the cache to storage.
-	// When the initial results are returned listing will be canceled.
-	discardResult bool
+	// pool and set of where the cache is located.
+	pool, set int
 }
 
 func init() {
@@ -109,20 +102,18 @@ func init() {
 // newMetacache constructs a new metacache from the options.
 func (o listPathOptions) newMetacache() metacache {
 	return metacache{
-		id:           o.ID,
-		bucket:       o.Bucket,
-		root:         o.BaseDir,
-		recursive:    o.Recursive,
-		status:       scanStateStarted,
-		error:        "",
-		started:      UTCNow(),
-		lastHandout:  UTCNow(),
-		lastUpdate:   UTCNow(),
-		ended:        time.Time{},
-		startedCycle: o.CurrentCycle,
-		endedCycle:   0,
-		dataVersion:  metacacheStreamVersion,
-		filter:       o.FilterPrefix,
+		id:          o.ID,
+		bucket:      o.Bucket,
+		root:        o.BaseDir,
+		recursive:   o.Recursive,
+		status:      scanStateStarted,
+		error:       "",
+		started:     UTCNow(),
+		lastHandout: UTCNow(),
+		lastUpdate:  UTCNow(),
+		ended:       time.Time{},
+		dataVersion: metacacheStreamVersion,
+		filter:      o.FilterPrefix,
 	}
 }
 
@@ -140,18 +131,29 @@ func (o *listPathOptions) debugln(data ...interface{}) {
 
 // gatherResults will collect all results on the input channel and filter results according to the options.
 // Caller should close the channel when done.
-// The returned function will return the results once there is enough or input is closed.
-func (o *listPathOptions) gatherResults(in <-chan metaCacheEntry) func() (metaCacheEntriesSorted, error) {
+// The returned function will return the results once there is enough or input is closed,
+// or the context is canceled.
+func (o *listPathOptions) gatherResults(ctx context.Context, in <-chan metaCacheEntry) func() (metaCacheEntriesSorted, error) {
 	var resultsDone = make(chan metaCacheEntriesSorted)
 	// Copy so we can mutate
 	resCh := resultsDone
+	var done bool
+	var mu sync.Mutex
 	resErr := io.EOF
 
 	go func() {
 		var results metaCacheEntriesSorted
+		var returned bool
 		for entry := range in {
-			if resCh == nil {
+			if returned {
 				// past limit
+				continue
+			}
+			mu.Lock()
+			returned = done
+			mu.Unlock()
+			if returned {
+				resCh = nil
 				continue
 			}
 			if !o.IncludeDirectories && entry.isDir() {
@@ -176,6 +178,7 @@ func (o *listPathOptions) gatherResults(in <-chan metaCacheEntry) func() (metaCa
 					resErr = nil
 					resCh <- results
 					resCh = nil
+					returned = true
 				}
 				continue
 			}
@@ -187,7 +190,15 @@ func (o *listPathOptions) gatherResults(in <-chan metaCacheEntry) func() (metaCa
 		}
 	}()
 	return func() (metaCacheEntriesSorted, error) {
-		return <-resultsDone, resErr
+		select {
+		case <-ctx.Done():
+			mu.Lock()
+			done = true
+			mu.Unlock()
+			return metaCacheEntriesSorted{}, ctx.Err()
+		case r := <-resultsDone:
+			return r, resErr
+		}
 	}
 }
 
@@ -240,9 +251,6 @@ func (o *listPathOptions) findFirstPart(fi FileInfo) (int, error) {
 
 // updateMetacacheListing will update the metacache listing.
 func (o *listPathOptions) updateMetacacheListing(m metacache, rpc *peerRESTClient) (metacache, error) {
-	if o.Transient {
-		return localMetacacheMgr.getTransient().updateCacheEntry(m)
-	}
 	if rpc == nil {
 		return localMetacacheMgr.updateCacheEntry(m)
 	}
@@ -273,9 +281,6 @@ func (o *listPathOptions) objectPath(block int) string {
 func (o *listPathOptions) SetFilter() {
 	switch {
 	case metacacheSharePrefix:
-		return
-	case o.CurrentCycle != o.OldestCycle:
-		// We have a clean bloom filter
 		return
 	case o.Prefix == o.BaseDir:
 		// No additional prefix
@@ -346,10 +351,8 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 	rpc := globalNotificationSys.restClientFromHash(o.Bucket)
 
 	for {
-		select {
-		case <-ctx.Done():
+		if contextCanceled(ctx) {
 			return entries, ctx.Err()
-		default:
 		}
 
 		// If many failures, check the cache state.
@@ -361,26 +364,29 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 			retries = 1
 		}
 
-		const retryDelay = 500 * time.Millisecond
-		// Load first part metadata...
+		const retryDelay = 250 * time.Millisecond
 		// All operations are performed without locks, so we must be careful and allow for failures.
 		// Read metadata associated with the object from a disk.
 		if retries > 0 {
-			disks := er.getOnlineDisks()
-			if len(disks) == 0 {
-				time.Sleep(retryDelay)
-				retries++
-				continue
-			}
-
-			_, err := disks[0].ReadVersion(ctx, minioMetaBucket, o.objectPath(0), "", false)
-			if err != nil {
-				time.Sleep(retryDelay)
-				retries++
-				continue
+			for _, disk := range er.getDisks() {
+				if disk == nil {
+					continue
+				}
+				if !disk.IsOnline() {
+					continue
+				}
+				_, err := disk.ReadVersion(ctx, minioMetaBucket,
+					o.objectPath(0), "", false)
+				if err != nil {
+					time.Sleep(retryDelay)
+					retries++
+					continue
+				}
+				break
 			}
 		}
 
+		// Load first part metadata...
 		// Read metadata associated with the object from all disks.
 		fi, metaArr, onlineDisks, err := er.getObjectFileInfo(ctx, minioMetaBucket, o.objectPath(0), ObjectOptions{}, true)
 		if err != nil {
@@ -419,10 +425,8 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 		// We got a stream to start at.
 		loadedPart := 0
 		for {
-			select {
-			case <-ctx.Done():
+			if contextCanceled(ctx) {
 				return entries, ctx.Err()
-			default:
 			}
 
 			if partN != loadedPart {
@@ -436,21 +440,25 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 
 				if retries > 0 {
 					// Load from one disk only
-					disks := er.getOnlineDisks()
-					if len(disks) == 0 {
-						time.Sleep(retryDelay)
-						retries++
-						continue
-					}
-
-					_, err := disks[0].ReadVersion(ctx, minioMetaBucket, o.objectPath(partN), "", false)
-					if err != nil {
-						time.Sleep(retryDelay)
-						retries++
-						continue
+					for _, disk := range er.getDisks() {
+						if disk == nil {
+							continue
+						}
+						if !disk.IsOnline() {
+							continue
+						}
+						_, err := disk.ReadVersion(ctx, minioMetaBucket,
+							o.objectPath(partN), "", false)
+						if err != nil {
+							time.Sleep(retryDelay)
+							retries++
+							continue
+						}
+						break
 					}
 				}
-				// Load first part metadata...
+
+				// Load partN metadata...
 				fi, metaArr, onlineDisks, err = er.getObjectFileInfo(ctx, minioMetaBucket, o.objectPath(partN), ObjectOptions{}, true)
 				if err != nil {
 					time.Sleep(retryDelay)
@@ -521,254 +529,223 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 }
 
 // Will return io.EOF if continuing would not yield more results.
-func (er *erasureObjects) listPath(ctx context.Context, o listPathOptions) (entries metaCacheEntriesSorted, err error) {
+func (er *erasureObjects) listPath(ctx context.Context, o listPathOptions, results chan<- metaCacheEntry) (err error) {
+	defer close(results)
 	o.debugf(color.Green("listPath:")+" with options: %#v", o)
 
-	// See if we have the listing stored.
-	if !o.Create && !o.discardResult {
-		entries, err := er.streamMetadataParts(ctx, o)
-		if IsErr(err, []error{
-			nil,
-			context.Canceled,
-			context.DeadlineExceeded,
-		}...) {
-			// Expected good errors we don't need to return error.
-			return entries, nil
-		}
-
-		if !errors.Is(err, io.EOF) { // io.EOF is expected and should be returned but no need to log it.
-			// Log an return errors on unexpected errors.
-			logger.LogIf(ctx, err)
-		}
-
-		return entries, err
-	}
-
-	meta := o.newMetacache()
-	rpc := globalNotificationSys.restClientFromHash(o.Bucket)
-	var metaMu sync.Mutex
-
-	o.debugln(color.Green("listPath:")+" scanning bucket:", o.Bucket, "basedir:", o.BaseDir, "prefix:", o.Prefix, "marker:", o.Marker)
-
-	// Disconnect from call above, but cancel on exit.
-	ctx, cancel := context.WithCancel(GlobalContext)
-	// We need to ask disks.
-	disks := er.getOnlineDisks()
-
-	defer func() {
-		o.debugln(color.Green("listPath:")+" returning:", entries.len(), "err:", err)
-		if err != nil && !errors.Is(err, io.EOF) {
-			go func(err string) {
-				metaMu.Lock()
-				if meta.status != scanStateError {
-					meta.error = err
-					meta.status = scanStateError
-				}
-				meta, _ = o.updateMetacacheListing(meta, rpc)
-				metaMu.Unlock()
-			}(err.Error())
-			cancel()
-		}
-	}()
-
 	askDisks := o.AskDisks
-	listingQuorum := askDisks - 1
+	listingQuorum := o.AskDisks - 1
+	disks := er.getDisks()
+	var fallbackDisks []StorageAPI
+
 	// Special case: ask all disks if the drive count is 4
 	if askDisks == -1 || er.setDriveCount == 4 {
 		askDisks = len(disks) // with 'strict' quorum list on all online disks.
 		listingQuorum = getReadQuorum(er.setDriveCount)
 	}
-
-	if len(disks) < askDisks {
-		err = InsufficientReadQuorum{}
-		logger.LogIf(ctx, fmt.Errorf("listPath: Insufficient disks, %d of %d needed are available", len(disks), askDisks))
-		cancel()
-		return
+	if askDisks == 0 {
+		askDisks = globalAPIConfig.getListQuorum()
+		listingQuorum = askDisks
 	}
-
-	// Select askDisks random disks.
-	if len(disks) > askDisks {
+	if askDisks > 0 && len(disks) > askDisks {
+		rand.Shuffle(len(disks), func(i, j int) {
+			disks[i], disks[j] = disks[j], disks[i]
+		})
+		fallbackDisks = disks[askDisks:]
 		disks = disks[:askDisks]
 	}
 
-	// Create output for our results.
-	var cacheCh chan metaCacheEntry
-	if !o.discardResult {
-		cacheCh = make(chan metaCacheEntry, metacacheBlockSize)
+	// How to resolve results.
+	resolver := metadataResolutionParams{
+		dirQuorum: listingQuorum,
+		objQuorum: listingQuorum,
+		bucket:    o.Bucket,
 	}
 
-	// Create filter for results.
-	filterCh := make(chan metaCacheEntry, 100)
-	filteredResults := o.gatherResults(filterCh)
-	closeChannels := func() {
-		if !o.discardResult {
-			close(cacheCh)
-		}
-		close(filterCh)
-	}
-
-	// Cancel listing on return if non-saved list.
-	if o.discardResult {
-		defer cancel()
-	}
-
-	go func() {
-		defer cancel()
-		// Save continuous updates
-		go func() {
-			var err error
-			ticker := time.NewTicker(10 * time.Second)
-			defer ticker.Stop()
-			var exit bool
-			for !exit {
+	ctxDone := ctx.Done()
+	return listPathRaw(ctx, listPathRawOptions{
+		disks:         disks,
+		fallbackDisks: fallbackDisks,
+		bucket:        o.Bucket,
+		path:          o.BaseDir,
+		recursive:     o.Recursive,
+		filterPrefix:  o.FilterPrefix,
+		minDisks:      listingQuorum,
+		forwardTo:     o.Marker,
+		agreed: func(entry metaCacheEntry) {
+			select {
+			case <-ctxDone:
+			case results <- entry:
+			}
+		},
+		partial: func(entries metaCacheEntries, nAgreed int, errs []error) {
+			// Results Disagree :-(
+			entry, ok := entries.resolve(&resolver)
+			if ok {
 				select {
-				case <-ticker.C:
-				case <-ctx.Done():
-					exit = true
+				case <-ctxDone:
+				case results <- *entry:
 				}
-				metaMu.Lock()
-				meta.endedCycle = intDataUpdateTracker.current()
-				meta, err = o.updateMetacacheListing(meta, rpc)
-				if meta.status == scanStateError {
-					logger.LogIf(ctx, err)
-					cancel()
-					exit = true
-				}
-				metaMu.Unlock()
 			}
-		}()
+		},
+	})
+}
 
-		const retryDelay = 200 * time.Millisecond
-		const maxTries = 5
+type metaCacheRPC struct {
+	o      listPathOptions
+	mu     sync.Mutex
+	meta   *metacache
+	rpc    *peerRESTClient
+	cancel context.CancelFunc
+}
 
-		var bw *metacacheBlockWriter
-		// Don't save single object listings.
-		if !o.discardResult {
-			// Write results to disk.
-			bw = newMetacacheBlockWriter(cacheCh, func(b *metacacheBlock) error {
-				// if the block is 0 bytes and its a first block skip it.
-				// skip only this for Transient caches.
-				if len(b.data) == 0 && b.n == 0 && o.Transient {
-					return nil
-				}
-				o.debugln(color.Green("listPath:")+" saving block", b.n, "to", o.objectPath(b.n))
-				r, err := hash.NewReader(bytes.NewReader(b.data), int64(len(b.data)), "", "", int64(len(b.data)))
-				logger.LogIf(ctx, err)
-				custom := b.headerKV()
-				_, err = er.putObject(ctx, minioMetaBucket, o.objectPath(b.n), NewPutObjReader(r), ObjectOptions{
-					UserDefined:    custom,
-					NoLock:         true, // No need to hold namespace lock, each prefix caches uniquely.
-					ParentIsObject: nil,
-				})
-				if err != nil {
-					metaMu.Lock()
-					if meta.error != "" {
-						meta.status = scanStateError
-						meta.error = err.Error()
-					}
-					metaMu.Unlock()
-					cancel()
-					return err
-				}
-				if b.n == 0 {
-					return nil
-				}
-				// Update block 0 metadata.
-				var retries int
-				for {
-					meta := b.headerKV()
-					fi := FileInfo{
-						Metadata: make(map[string]string, len(meta)),
-					}
-					for k, v := range meta {
-						fi.Metadata[k] = v
-					}
-					err := er.updateObjectMeta(ctx, minioMetaBucket, o.objectPath(0), fi)
-					if err == nil {
-						break
-					}
-					switch err.(type) {
-					case ObjectNotFound:
-						return err
-					case InsufficientReadQuorum:
-					default:
-						logger.LogIf(ctx, err)
-					}
-					if retries >= maxTries {
-						return err
-					}
-					retries++
-					time.Sleep(retryDelay)
-				}
-				return nil
-			})
-		}
+func (m *metaCacheRPC) setErr(err string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	meta := *m.meta
+	if meta.status != scanStateError {
+		meta.error = err
+		meta.status = scanStateError
+	} else {
+		// An error is already set.
+		return
+	}
+	meta, _ = m.o.updateMetacacheListing(meta, m.rpc)
+	*m.meta = meta
+}
 
-		// How to resolve results.
-		resolver := metadataResolutionParams{
-			dirQuorum: listingQuorum,
-			objQuorum: listingQuorum,
-			bucket:    o.Bucket,
-		}
+func (er *erasureObjects) saveMetaCacheStream(ctx context.Context, mc *metaCacheRPC, entries <-chan metaCacheEntry) (err error) {
+	o := mc.o
+	o.debugf(color.Green("saveMetaCacheStream:")+" with options: %#v", o)
 
-		err := listPathRaw(ctx, listPathRawOptions{
-			disks:        disks,
-			bucket:       o.Bucket,
-			path:         o.BaseDir,
-			recursive:    o.Recursive,
-			filterPrefix: o.FilterPrefix,
-			minDisks:     listingQuorum,
-			agreed: func(entry metaCacheEntry) {
-				if !o.discardResult {
-					cacheCh <- entry
-				}
-				filterCh <- entry
-			},
-			partial: func(entries metaCacheEntries, nAgreed int, errs []error) {
-				// Results Disagree :-(
-				entry, ok := entries.resolve(&resolver)
-				if ok {
-					if !o.discardResult {
-						cacheCh <- *entry
-					}
-					filterCh <- *entry
-				}
-			},
-		})
-
-		metaMu.Lock()
-		if err != nil {
-			meta.status = scanStateError
-			meta.error = err.Error()
-		}
-		// Save success
-		if meta.error == "" {
-			meta.status = scanStateSuccess
-			meta.endedCycle = intDataUpdateTracker.current()
-		}
-
-		meta, _ = o.updateMetacacheListing(meta, rpc)
-		metaMu.Unlock()
-
-		closeChannels()
-		if !o.discardResult {
-			if err := bw.Close(); err != nil {
-				metaMu.Lock()
-				meta.error = err.Error()
-				meta.status = scanStateError
-				meta, _ = o.updateMetacacheListing(meta, rpc)
-				metaMu.Unlock()
-			}
+	metaMu := &mc.mu
+	rpc := mc.rpc
+	cancel := mc.cancel
+	defer func() {
+		o.debugln(color.Green("saveMetaCacheStream:")+"err:", err)
+		if err != nil && !errors.Is(err, io.EOF) {
+			go mc.setErr(err.Error())
+			cancel()
 		}
 	}()
 
-	return filteredResults()
+	defer cancel()
+	// Save continuous updates
+	go func() {
+		var err error
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		var exit bool
+		for !exit {
+			select {
+			case <-ticker.C:
+			case <-ctx.Done():
+				exit = true
+			}
+			metaMu.Lock()
+			meta := *mc.meta
+			meta, err = o.updateMetacacheListing(meta, rpc)
+			if err == nil && time.Since(meta.lastHandout) > metacacheMaxClientWait {
+				cancel()
+				exit = true
+				meta.status = scanStateError
+				meta.error = fmt.Sprintf("listing canceled since time since last handout was %v ago", time.Since(meta.lastHandout).Round(time.Second))
+				o.debugln(color.Green("saveMetaCacheStream: ") + meta.error)
+				meta, err = o.updateMetacacheListing(meta, rpc)
+			}
+			if err == nil {
+				*mc.meta = meta
+				if meta.status == scanStateError {
+					cancel()
+					exit = true
+				}
+			}
+			metaMu.Unlock()
+		}
+	}()
+
+	const retryDelay = 200 * time.Millisecond
+	const maxTries = 5
+
+	// Keep destination...
+	// Write results to disk.
+	bw := newMetacacheBlockWriter(entries, func(b *metacacheBlock) error {
+		// if the block is 0 bytes and its a first block skip it.
+		// skip only this for Transient caches.
+		if len(b.data) == 0 && b.n == 0 && o.Transient {
+			return nil
+		}
+		o.debugln(color.Green("saveMetaCacheStream:")+" saving block", b.n, "to", o.objectPath(b.n))
+		r, err := hash.NewReader(bytes.NewReader(b.data), int64(len(b.data)), "", "", int64(len(b.data)))
+		logger.LogIf(ctx, err)
+		custom := b.headerKV()
+		_, err = er.putMetacacheObject(ctx, o.objectPath(b.n), NewPutObjReader(r), ObjectOptions{
+			UserDefined: custom,
+		})
+		if err != nil {
+			mc.setErr(err.Error())
+			cancel()
+			return err
+		}
+		if b.n == 0 {
+			return nil
+		}
+		// Update block 0 metadata.
+		var retries int
+		for {
+			meta := b.headerKV()
+			fi := FileInfo{
+				Metadata: make(map[string]string, len(meta)),
+			}
+			for k, v := range meta {
+				fi.Metadata[k] = v
+			}
+			err := er.updateObjectMeta(ctx, minioMetaBucket, o.objectPath(0), fi)
+			if err == nil {
+				break
+			}
+			switch err.(type) {
+			case ObjectNotFound:
+				return err
+			case StorageErr:
+				return err
+			case InsufficientReadQuorum:
+			default:
+				logger.LogIf(ctx, err)
+			}
+			if retries >= maxTries {
+				return err
+			}
+			retries++
+			time.Sleep(retryDelay)
+		}
+		return nil
+	})
+
+	// Blocks while consuming entries or an error occurs.
+	err = bw.Close()
+	if err != nil {
+		mc.setErr(err.Error())
+	}
+	metaMu.Lock()
+	defer metaMu.Unlock()
+	if mc.meta.error != "" {
+		return err
+	}
+	// Save success
+	mc.meta.status = scanStateSuccess
+	meta, err := o.updateMetacacheListing(*mc.meta, rpc)
+	if err == nil {
+		*mc.meta = meta
+	}
+	return nil
 }
 
 type listPathRawOptions struct {
-	disks        []StorageAPI
-	bucket, path string
-	recursive    bool
+	disks         []StorageAPI
+	fallbackDisks []StorageAPI
+	bucket, path  string
+	recursive     bool
 
 	// Only return results with this prefix.
 	filterPrefix string
@@ -808,10 +785,20 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 	if len(disks) == 0 {
 		return fmt.Errorf("listPathRaw: 0 drives provided")
 	}
+
 	// Cancel upstream if we finish before we expect.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	fallback := func(err error) bool {
+		switch err.(type) {
+		case StorageErr:
+			// all supported disk errors
+			// attempt a fallback.
+			return true
+		}
+		return false
+	}
 	askDisks := len(disks)
 	readers := make([]*metacacheReader, askDisks)
 	for i := range disks {
@@ -824,18 +811,49 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 
 		// Send request to each disk.
 		go func() {
-			werr := d.WalkDir(ctx, WalkDirOptions{
-				Bucket:         opts.bucket,
-				BaseDir:        opts.path,
-				Recursive:      opts.recursive,
-				ReportNotFound: opts.reportNotFound,
-				FilterPrefix:   opts.filterPrefix,
-				ForwardTo:      opts.forwardTo,
-			}, w)
+			var werr error
+			if d == nil {
+				werr = errDiskNotFound
+			} else {
+				werr = d.WalkDir(ctx, WalkDirOptions{
+					Bucket:         opts.bucket,
+					BaseDir:        opts.path,
+					Recursive:      opts.recursive,
+					ReportNotFound: opts.reportNotFound,
+					FilterPrefix:   opts.filterPrefix,
+					ForwardTo:      opts.forwardTo,
+				}, w)
+			}
+
+			// fallback only when set.
+			if len(opts.fallbackDisks) > 0 && fallback(werr) {
+				// This fallback is only set when
+				// askDisks is less than total
+				// number of disks per set.
+				for _, fd := range opts.fallbackDisks {
+					if fd == nil {
+						continue
+					}
+					werr = fd.WalkDir(ctx, WalkDirOptions{
+						Bucket:         opts.bucket,
+						BaseDir:        opts.path,
+						Recursive:      opts.recursive,
+						ReportNotFound: opts.reportNotFound,
+						FilterPrefix:   opts.filterPrefix,
+						ForwardTo:      opts.forwardTo,
+					}, w)
+					if werr == nil {
+						break
+					}
+				}
+			}
 			w.CloseWithError(werr)
+
 			if werr != io.EOF && werr != nil &&
 				werr.Error() != errFileNotFound.Error() &&
 				werr.Error() != errVolumeNotFound.Error() &&
+				werr.Error() != errDiskNotFound.Error() &&
+				werr.Error() != errUnformattedDisk.Error() &&
 				!errors.Is(werr, context.Canceled) {
 				logger.LogIf(ctx, werr)
 			}
@@ -851,10 +869,8 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 		for i := range topEntries {
 			topEntries[i] = metaCacheEntry{}
 		}
-		select {
-		case <-ctx.Done():
+		if contextCanceled(ctx) {
 			return ctx.Err()
-		default:
 		}
 		for i, r := range readers {
 			if errs[i] != nil {
@@ -868,12 +884,11 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 				continue
 			case nil:
 			default:
-				if err.Error() == errFileNotFound.Error() {
-					atEOF++
-					fnf++
-					continue
-				}
-				if err.Error() == errVolumeNotFound.Error() {
+				switch err.Error() {
+				case errFileNotFound.Error(),
+					errVolumeNotFound.Error(),
+					errUnformattedDisk.Error(),
+					errDiskNotFound.Error():
 					atEOF++
 					fnf++
 					continue
@@ -922,7 +937,12 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 			var combinedErr []string
 			for i, err := range errs {
 				if err != nil {
-					combinedErr = append(combinedErr, fmt.Sprintf("disk %d returned: %s", i, err))
+					if disks[i] != nil {
+						combinedErr = append(combinedErr,
+							fmt.Sprintf("disk %s returned: %s", disks[i], err))
+					} else {
+						combinedErr = append(combinedErr, err.Error())
+					}
 				}
 			}
 			return errors.New(strings.Join(combinedErr, ", "))

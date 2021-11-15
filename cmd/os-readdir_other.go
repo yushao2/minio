@@ -1,3 +1,4 @@
+//go:build plan9 || solaris
 // +build plan9 solaris
 
 // Copyright (c) 2015-2021 MinIO, Inc.
@@ -28,11 +29,6 @@ import (
 func access(name string) error {
 	_, err := os.Lstat(name)
 	return err
-}
-
-// Return all the entries at the directory dirPath.
-func readDir(dirPath string) (entries []string, err error) {
-	return readDirN(dirPath, -1)
 }
 
 // readDirFn applies the fn() function on each entries at dirPath, doesn't recurse into
@@ -90,8 +86,8 @@ func readDirFn(dirPath string, filter func(name string, typ os.FileMode) error) 
 	return nil
 }
 
-// Return N entries at the directory dirPath. If count is -1, return all entries
-func readDirN(dirPath string, count int) (entries []string, err error) {
+// Return entries at the directory dirPath.
+func readDirWithOpts(dirPath string, opts readDirOpts) (entries []string, err error) {
 	d, err := Open(dirPath)
 	if err != nil {
 		return nil, osErrToFileErr(err)
@@ -99,12 +95,12 @@ func readDirN(dirPath string, count int) (entries []string, err error) {
 	defer d.Close()
 
 	maxEntries := 1000
-	if count > 0 && count < maxEntries {
-		maxEntries = count
+	if opts.count > 0 && opts.count < maxEntries {
+		maxEntries = opts.count
 	}
 
 	done := false
-	remaining := count
+	remaining := opts.count
 
 	for !done {
 		// Read up to max number of entries.
@@ -115,7 +111,7 @@ func readDirN(dirPath string, count int) (entries []string, err error) {
 			}
 			return nil, osErrToFileErr(err)
 		}
-		if count > -1 {
+		if opts.count > -1 {
 			if remaining <= len(fis) {
 				fis = fis[:remaining]
 				done = true
@@ -136,7 +132,7 @@ func readDirN(dirPath string, count int) (entries []string, err error) {
 				}
 
 				// Ignore symlinked directories.
-				if fi.IsDir() {
+				if !opts.followDirSymlink && fi.IsDir() {
 					continue
 				}
 			}
@@ -147,7 +143,7 @@ func readDirN(dirPath string, count int) (entries []string, err error) {
 			} else if fi.Mode().IsRegular() {
 				entries = append(entries, fi.Name())
 			}
-			if count > 0 {
+			if opts.count > 0 {
 				remaining--
 			}
 		}

@@ -167,6 +167,7 @@ func (m fsMetaV1) ToObjectInfo(bucket, object string, fi os.FileInfo) ObjectInfo
 	}
 
 	objInfo.ETag = extractETag(m.Meta)
+
 	objInfo.ContentType = m.Meta["content-type"]
 	objInfo.ContentEncoding = m.Meta["content-encoding"]
 	if storageClass, ok := m.Meta[xhttp.AmzStorageClass]; ok {

@@ -38,12 +38,11 @@ import (
 
 	"github.com/Azure/azure-pipeline-go/pipeline"
 	"github.com/Azure/azure-storage-blob-go/azblob"
-	humanize "github.com/dustin/go-humanize"
+	"github.com/dustin/go-humanize"
 	"github.com/minio/cli"
 	"github.com/minio/madmin-go"
 	miniogopolicy "github.com/minio/minio-go/v7/pkg/policy"
 	minio "github.com/minio/minio/cmd"
-	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/bucket/policy"
 	"github.com/minio/pkg/bucket/policy/condition"
@@ -138,14 +137,14 @@ func (g *Azure) Name() string {
 }
 
 // NewGatewayLayer initializes azure blob storage client and returns AzureObjects.
-func (g *Azure) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error) {
+func (g *Azure) NewGatewayLayer(creds madmin.Credentials) (minio.ObjectLayer, error) {
 	var err error
 
 	// Override credentials from the Azure storage environment variables if specified
 	if acc, key := env.Get("AZURE_STORAGE_ACCOUNT", creds.AccessKey), env.Get("AZURE_STORAGE_KEY", creds.SecretKey); acc != "" && key != "" {
-		creds, err = auth.CreateCredentials(acc, key)
-		if err != nil {
-			return nil, err
+		creds = madmin.Credentials{
+			AccessKey: acc,
+			SecretKey: key,
 		}
 	}
 
@@ -242,11 +241,6 @@ func parseStorageEndpoint(host string, accountName string) (*url.URL, error) {
 	}
 
 	return url.Parse(endpoint)
-}
-
-// Production - Azure gateway is production ready.
-func (g *Azure) Production() bool {
-	return true
 }
 
 // s3MetaToAzureProperties converts metadata meant for S3 PUT/COPY
@@ -629,8 +623,8 @@ func (a *azureObjects) ListBuckets(ctx context.Context) (buckets []minio.BucketI
 }
 
 // DeleteBucket - delete a container on azure, uses Azure equivalent `ContainerURL.Delete`.
-func (a *azureObjects) DeleteBucket(ctx context.Context, bucket string, forceDelete bool) error {
-	if !forceDelete {
+func (a *azureObjects) DeleteBucket(ctx context.Context, bucket string, opts minio.DeleteBucketOptions) error {
+	if !opts.Force {
 		// Check if the container is empty before deleting it.
 		result, err := a.ListObjects(ctx, bucket, "", "", "", 1)
 		if err != nil {

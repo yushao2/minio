@@ -56,7 +56,6 @@ export class ObjectsStats extends React.Component {
     const { filteredObjects, listLoading } = this.props
 
     const visibleObjects = filteredObjects.slice(0, this.state.page * 100)
-    console.log(filteredObjects)
     return (
       <div className="feb-container">Total objects: {listLoading ? "" : filteredObjects.length}</div>
     )

@@ -24,7 +24,9 @@ import (
 	pathutil "path"
 	"runtime"
 	"strings"
+	"time"
 
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/lock"
 	"github.com/minio/minio/internal/logger"
 )
@@ -168,6 +170,25 @@ func fsStat(ctx context.Context, statLoc string) (os.FileInfo, error) {
 	return fi, nil
 }
 
+// fsTouch updates a file access & modtime with current time
+func fsTouch(ctx context.Context, statLoc string) error {
+	if statLoc == "" {
+		logger.LogIf(ctx, errInvalidArgument)
+		return errInvalidArgument
+	}
+	if err := checkPathLength(statLoc); err != nil {
+		logger.LogIf(ctx, err)
+		return err
+	}
+	now := time.Now()
+	if err := os.Chtimes(statLoc, now, now); err != nil {
+		logger.LogIf(ctx, err)
+		return err
+	}
+
+	return nil
+}
+
 // Lookup if volume exists, returns volume attributes upon success.
 func fsStatVolume(ctx context.Context, volume string) (os.FileInfo, error) {
 	fi, err := fsStat(ctx, volume)
@@ -248,6 +269,7 @@ func fsOpenFile(ctx context.Context, readPath string, offset int64) (io.ReadClos
 	// Stat to get the size of the file at path.
 	st, err := fr.Stat()
 	if err != nil {
+		fr.Close()
 		err = osErrToFileErr(err)
 		if err != errFileNotFound {
 			logger.LogIf(ctx, err)
@@ -257,6 +279,7 @@ func fsOpenFile(ctx context.Context, readPath string, offset int64) (io.ReadClos
 
 	// Verify if its not a regular file, since subsequent Seek is undefined.
 	if !st.Mode().IsRegular() {
+		fr.Close()
 		return nil, 0, errIsNotRegular
 	}
 
@@ -264,6 +287,7 @@ func fsOpenFile(ctx context.Context, readPath string, offset int64) (io.ReadClos
 	if offset > 0 {
 		_, err = fr.Seek(offset, io.SeekStart)
 		if err != nil {
+			fr.Close()
 			logger.LogIf(ctx, err)
 			return nil, 0, err
 		}
@@ -311,7 +335,7 @@ func fsCreateFile(ctx context.Context, filePath string, reader io.Reader, falloc
 	}
 	defer writer.Close()
 
-	bytesWritten, err := io.Copy(writer, reader)
+	bytesWritten, err := xioutil.Copy(writer, reader)
 	if err != nil {
 		logger.LogIf(ctx, err)
 		return 0, err

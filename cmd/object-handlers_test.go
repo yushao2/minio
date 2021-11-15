@@ -26,6 +26,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"path"
 	"runtime"
 	"strings"
 
@@ -557,12 +558,8 @@ func testAPIGetObjectHandler(obj ObjectLayer, instanceType, bucketName string, a
 			t.Fatalf("Test %d: %s: Failed parsing response body: <ERROR> %v", i+1, instanceType, err)
 		}
 
-		if actualError.BucketName != testCase.bucketName {
-			t.Fatalf("Test %d: %s: Unexpected bucket name, expected %s, got %s", i+1, instanceType, testCase.bucketName, actualError.BucketName)
-		}
-
-		if actualError.Key != testCase.objectName {
-			t.Fatalf("Test %d: %s: Unexpected object name, expected %s, got %s", i+1, instanceType, testCase.objectName, actualError.Key)
+		if path.Clean(actualError.Resource) != pathJoin(SlashSeparator, testCase.bucketName, testCase.objectName) {
+			t.Fatalf("Test %d: %s: Unexpected resource, expected %s, got %s", i+1, instanceType, pathJoin(SlashSeparator, testCase.bucketName, testCase.objectName), actualError.Resource)
 		}
 
 		// Verify response of the V2 signed HTTP request.
@@ -606,12 +603,8 @@ func testAPIGetObjectHandler(obj ObjectLayer, instanceType, bucketName string, a
 			t.Fatalf("Test %d: %s: Failed parsing response body: <ERROR> %v", i+1, instanceType, err)
 		}
 
-		if actualError.BucketName != testCase.bucketName {
-			t.Fatalf("Test %d: %s: Unexpected bucket name, expected %s, got %s", i+1, instanceType, testCase.bucketName, actualError.BucketName)
-		}
-
-		if actualError.Key != testCase.objectName {
-			t.Fatalf("Test %d: %s: Unexpected object name, expected %s, got %s", i+1, instanceType, testCase.objectName, actualError.Key)
+		if path.Clean(actualError.Resource) != pathJoin(SlashSeparator, testCase.bucketName, testCase.objectName) {
+			t.Fatalf("Test %d: %s: Unexpected resource, expected %s, got %s", i+1, instanceType, pathJoin(SlashSeparator, testCase.bucketName, testCase.objectName), actualError.Resource)
 		}
 	}
 
@@ -918,7 +911,6 @@ func testAPIGetObjectWithPartNumberHandler(obj ObjectLayer, instanceType, bucket
 
 	mkGetReqWithPartNumber := func(oindex int, oi ObjectInput, partNumber int) {
 		object := oi.objectName
-		rec := httptest.NewRecorder()
 
 		queries := url.Values{}
 		queries.Add("partNumber", strconv.Itoa(partNumber))
@@ -930,6 +922,7 @@ func testAPIGetObjectWithPartNumberHandler(obj ObjectLayer, instanceType, bucket
 				object, oindex, partNumber, err)
 		}
 
+		rec := httptest.NewRecorder()
 		apiRouter.ServeHTTP(rec, req)
 
 		// Check response code (we make only valid requests in this test)
@@ -1120,7 +1113,7 @@ func testAPIPutObjectStreamSigV4Handler(obj ObjectLayer, instanceType, bucketNam
 			dataLen:            1024,
 			chunkSize:          1024,
 			expectedContent:    []byte{},
-			expectedRespStatus: http.StatusInternalServerError,
+			expectedRespStatus: http.StatusBadRequest,
 			accessKey:          credentials.AccessKey,
 			secretKey:          credentials.SecretKey,
 			shouldPass:         false,
@@ -1181,7 +1174,7 @@ func testAPIPutObjectStreamSigV4Handler(obj ObjectLayer, instanceType, bucketNam
 			dataLen:            1024,
 			chunkSize:          1024,
 			expectedContent:    []byte{},
-			expectedRespStatus: http.StatusInternalServerError,
+			expectedRespStatus: http.StatusBadRequest,
 			accessKey:          credentials.AccessKey,
 			secretKey:          credentials.SecretKey,
 			shouldPass:         false,
@@ -3388,7 +3381,7 @@ func testAPIPutObjectPartHandlerStreaming(obj ObjectLayer, instanceType, bucketN
 
 	noAPIErr := APIError{}
 	missingDateHeaderErr := getAPIError(ErrMissingDateHeader)
-	internalErr := getAPIError(ErrInternalError)
+	internalErr := getAPIError(ErrBadRequest)
 	testCases := []struct {
 		fault       Fault
 		expectedErr APIError

@@ -1,4 +1,5 @@
 ## MinIO Server Limits Per Tenant
+For best deployment experience MinIO recommends operating systems RHEL/CentOS 8.x or later, Ubuntu 18.04 LTS or later. These operating systems package the latest 'xfsprogs' that support large scale deployments.
 
 ### Erasure Code (Multiple Drives / Servers)
 
@@ -26,8 +27,11 @@
 | Maximum number of parts per upload                                              | 10,000                                        |
 | Part size range                                                                 | 5 MiB to 5 GiB. Last part can be 0 B to 5 GiB |
 | Maximum number of parts returned per list parts request                         | 10000                                         |
-| Maximum number of objects returned per list objects request                     | 4500                                          |
+| Maximum number of objects returned per list objects request                     | 1000                                          |
 | Maximum number of multipart uploads returned per list multipart uploads request | 1000                                          |
+| Maximum length for bucket names                                                 | 63                                            |
+| Maximum length for object names                                                 | 1024                                          |
+| Maximum length for '/' separated object name segment                            | 255                                           |
 
 ### List of Amazon S3 API's not supported on MinIO
 We found the following APIs to be redundant or less useful outside of AWS S3. If you have a different view on any of the APIs we missed, please open a [GitHub issue](https://github.com/minio/minio/issues).
@@ -46,6 +50,16 @@ We found the following APIs to be redundant or less useful outside of AWS S3. If
 - ObjectTorrent
 
 ### Object name restrictions on MinIO
-Object names that contain characters `^*|\/&";` are unsupported on Windows and other file systems which do not support filenames with these characters. NOTE: This list is not an exhaustive, it depends on the operating system and filesystem under use.
 
-For best experience we recommend that you use distributions that ship fairly recent Linux kernel such as CentOS 8, Ubuntu 18.04 LTS along with XFS as the choice for your backend filesystem.
+- Object names that contain characters `^*|\/&";` are unsupported on Windows platform or any other file systems that do not support filenames with special charaters. **This list is non exhaustive, it depends on the operating system and filesystem under use - please consult your operating system vendor**. MinIO recommends using Linux based deployments for production workloads.
+- Objects should not have conflicting objects as parents, applications using this behavior should change their behavior and use proper unique keys, for example situations such as following conflicting key patterns are not supported.
+
+```
+PUT <bucketname>/a/b/1.txt
+PUT <bucketname>/a/b
+```
+
+```
+PUT <bucketname>/a/b
+PUT <bucketname>/a/b/1.txt
+```

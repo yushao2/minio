@@ -37,16 +37,19 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"runtime/trace"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	humanize "github.com/dustin/go-humanize"
+	"github.com/dustin/go-humanize"
 	"github.com/gorilla/mux"
 	"github.com/minio/madmin-go"
+	miniogopolicy "github.com/minio/minio-go/v7/pkg/policy"
 	"github.com/minio/minio/internal/handlers"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/logger/message/audit"
 	"github.com/minio/minio/internal/rest"
 	"github.com/minio/pkg/certs"
 )
@@ -54,6 +57,13 @@ import (
 const (
 	slashSeparator = "/"
 )
+
+// BucketAccessPolicy - Collection of canned bucket policy at a given prefix.
+type BucketAccessPolicy struct {
+	Bucket string                     `json:"bucket"`
+	Prefix string                     `json:"prefix"`
+	Policy miniogopolicy.BucketPolicy `json:"policy"`
+}
 
 // IsErrIgnored returns whether given error is ignored or not.
 func IsErrIgnored(err error, ignoredErrs ...error) bool {
@@ -209,25 +219,27 @@ func contains(slice interface{}, elem interface{}) bool {
 // disk since the name of this latter is randomly generated.
 type profilerWrapper struct {
 	// Profile recorded at start of benchmark.
-	base   []byte
-	stopFn func() ([]byte, error)
-	ext    string
+	records map[string][]byte
+	stopFn  func() ([]byte, error)
+	ext     string
 }
 
-// recordBase will record the profile and store it as the base.
-func (p *profilerWrapper) recordBase(name string, debug int) {
+// record will record the profile and store it as the base.
+func (p *profilerWrapper) record(profileType string, debug int, recordName string) {
 	var buf bytes.Buffer
-	p.base = nil
-	err := pprof.Lookup(name).WriteTo(&buf, debug)
+	if p.records == nil {
+		p.records = make(map[string][]byte)
+	}
+	err := pprof.Lookup(profileType).WriteTo(&buf, debug)
 	if err != nil {
 		return
 	}
-	p.base = buf.Bytes()
+	p.records[recordName] = buf.Bytes()
 }
 
-// Base returns the recorded base if any.
-func (p profilerWrapper) Base() []byte {
-	return p.base
+// Records returns the recorded profiling if any.
+func (p profilerWrapper) Records() map[string][]byte {
+	return p.records
 }
 
 // Stop the currently running benchmark.
@@ -259,9 +271,10 @@ func getProfileData() (map[string][]byte, error) {
 		if err == nil {
 			dst[typ+"."+prof.Extension()] = buf
 		}
-		buf = prof.Base()
-		if len(buf) > 0 {
-			dst[typ+"-before"+"."+prof.Extension()] = buf
+		for name, buf := range prof.Records() {
+			if len(buf) > 0 {
+				dst[typ+"-"+name+"."+prof.Extension()] = buf
+			}
 		}
 	}
 	return dst, nil
@@ -305,7 +318,7 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 		}
 	case madmin.ProfilerMEM:
 		runtime.GC()
-		prof.recordBase("heap", 0)
+		prof.record("heap", 0, "before")
 		prof.stopFn = func() ([]byte, error) {
 			runtime.GC()
 			var buf bytes.Buffer
@@ -321,7 +334,7 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 			return buf.Bytes(), err
 		}
 	case madmin.ProfilerMutex:
-		prof.recordBase("mutex", 0)
+		prof.record("mutex", 0, "before")
 		runtime.SetMutexProfileFraction(1)
 		prof.stopFn = func() ([]byte, error) {
 			var buf bytes.Buffer
@@ -330,7 +343,7 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 			return buf.Bytes(), err
 		}
 	case madmin.ProfilerThreads:
-		prof.recordBase("threadcreate", 0)
+		prof.record("threadcreate", 0, "before")
 		prof.stopFn = func() ([]byte, error) {
 			var buf bytes.Buffer
 			err := pprof.Lookup("threadcreate").WriteTo(&buf, 0)
@@ -338,7 +351,8 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 		}
 	case madmin.ProfilerGoroutines:
 		prof.ext = "txt"
-		prof.recordBase("goroutine", 1)
+		prof.record("goroutine", 1, "before")
+		prof.record("goroutine", 2, "before,debug=2")
 		prof.stopFn = func() ([]byte, error) {
 			var buf bytes.Buffer
 			err := pprof.Lookup("goroutine").WriteTo(&buf, 1)
@@ -377,8 +391,8 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 
 // minioProfiler - minio profiler interface.
 type minioProfiler interface {
-	// Return base profile. 'nil' if none.
-	Base() []byte
+	// Return recorded profiles, each profile associated with a distinct generic name.
+	Records() map[string][]byte
 	// Stop the profiler
 	Stop() ([]byte, error)
 	// Return extension of profile
@@ -500,6 +514,7 @@ func newCustomHTTPProxyTransport(tlsConfig *tls.Config, dialTimeout time.Duratio
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           xhttp.DialContextWithDNSCache(globalDNSCache, xhttp.NewInternodeDialContext(dialTimeout)),
 		MaxIdleConnsPerHost:   1024,
+		MaxConnsPerHost:       1024,
 		WriteBufferSize:       16 << 10, // 16KiB moving up from 4KiB default
 		ReadBufferSize:        16 << 10, // 16KiB moving up from 4KiB default
 		IdleConnTimeout:       15 * time.Second,
@@ -921,4 +936,163 @@ func decodeDirObject(object string) string {
 func loadAndResetRPCNetworkErrsCounter() uint64 {
 	defer rest.ResetNetworkErrsCounter()
 	return rest.GetNetworkErrsCounter()
+}
+
+// Helper method to return total number of nodes in cluster
+func totalNodeCount() uint64 {
+	peers, _ := globalEndpoints.peers()
+	totalNodesCount := uint64(len(peers))
+	if totalNodesCount == 0 {
+		totalNodesCount = 1 // For standalone erasure coding
+	}
+	return totalNodesCount
+}
+
+// AuditLogOptions takes options for audit logging subsystem activity
+type AuditLogOptions struct {
+	Trigger   string
+	APIName   string
+	Status    string
+	VersionID string
+}
+
+// sends audit logs for internal subsystem activity
+func auditLogInternal(ctx context.Context, bucket, object string, opts AuditLogOptions) {
+	entry := audit.NewEntry(globalDeploymentID)
+	entry.Trigger = opts.Trigger
+	entry.API.Name = opts.APIName
+	entry.API.Bucket = bucket
+	entry.API.Object = object
+	if opts.VersionID != "" {
+		entry.ReqQuery = make(map[string]string)
+		entry.ReqQuery[xhttp.VersionID] = opts.VersionID
+	}
+	entry.API.Status = opts.Status
+	ctx = logger.SetAuditEntry(ctx, &entry)
+	logger.AuditLog(ctx, nil, nil, nil)
+}
+
+// Get the max throughput and iops numbers.
+func speedTest(ctx context.Context, throughputSize, concurrencyStart int, duration time.Duration, autotune bool) chan madmin.SpeedTestResult {
+	ch := make(chan madmin.SpeedTestResult, 1)
+	go func() {
+		defer close(ch)
+
+		objAPI := newObjectLayerFn()
+		if objAPI == nil {
+			return
+		}
+
+		concurrency := concurrencyStart
+
+		throughputHighestGet := uint64(0)
+		throughputHighestPut := uint64(0)
+		var throughputHighestResults []SpeedtestResult
+
+		sendResult := func() {
+			var result madmin.SpeedTestResult
+
+			durationSecs := duration.Seconds()
+
+			result.GETStats.ThroughputPerSec = throughputHighestGet / uint64(durationSecs)
+			result.GETStats.ObjectsPerSec = throughputHighestGet / uint64(throughputSize) / uint64(durationSecs)
+			result.PUTStats.ThroughputPerSec = throughputHighestPut / uint64(durationSecs)
+			result.PUTStats.ObjectsPerSec = throughputHighestPut / uint64(throughputSize) / uint64(durationSecs)
+			for i := 0; i < len(throughputHighestResults); i++ {
+				errStr := ""
+				if throughputHighestResults[i].Error != "" {
+					errStr = throughputHighestResults[i].Error
+				}
+				result.PUTStats.Servers = append(result.PUTStats.Servers, madmin.SpeedTestStatServer{
+					Endpoint:         throughputHighestResults[i].Endpoint,
+					ThroughputPerSec: throughputHighestResults[i].Uploads / uint64(durationSecs),
+					ObjectsPerSec:    throughputHighestResults[i].Uploads / uint64(throughputSize) / uint64(durationSecs),
+					Err:              errStr,
+				})
+				result.GETStats.Servers = append(result.GETStats.Servers, madmin.SpeedTestStatServer{
+					Endpoint:         throughputHighestResults[i].Endpoint,
+					ThroughputPerSec: throughputHighestResults[i].Downloads / uint64(durationSecs),
+					ObjectsPerSec:    throughputHighestResults[i].Downloads / uint64(throughputSize) / uint64(durationSecs),
+					Err:              errStr,
+				})
+			}
+
+			numDisks := 0
+			if pools, ok := objAPI.(*erasureServerPools); ok {
+				for _, set := range pools.serverPools {
+					numDisks = set.setCount * set.setDriveCount
+				}
+			}
+			result.Disks = numDisks
+			result.Servers = len(globalNotificationSys.peerClients) + 1
+			result.Version = Version
+			result.Size = throughputSize
+			result.Concurrent = concurrency
+
+			ch <- result
+		}
+
+		for {
+			select {
+			case <-ctx.Done():
+				// If the client got disconnected stop the speedtest.
+				return
+			default:
+			}
+
+			results := globalNotificationSys.Speedtest(ctx, throughputSize, concurrency, duration)
+			sort.Slice(results, func(i, j int) bool {
+				return results[i].Endpoint < results[j].Endpoint
+			})
+			totalPut := uint64(0)
+			totalGet := uint64(0)
+			for _, result := range results {
+				totalPut += result.Uploads
+				totalGet += result.Downloads
+			}
+
+			if totalGet < throughputHighestGet {
+				// Following check is for situations
+				// when Writes() scale higher than Reads()
+				// - practically speaking this never happens
+				// and should never happen - however it has
+				// been seen recently due to hardware issues
+				// causes Reads() to go slower than Writes().
+				//
+				// Send such results anyways as this shall
+				// expose a problem underneath.
+				if totalPut > throughputHighestPut {
+					throughputHighestResults = results
+					throughputHighestPut = totalPut
+					// let the client see lower value as well
+					throughputHighestGet = totalGet
+				}
+				sendResult()
+				break
+			}
+
+			doBreak := false
+			if float64(totalGet-throughputHighestGet)/float64(totalGet) < 0.025 {
+				doBreak = true
+			}
+
+			throughputHighestGet = totalGet
+			throughputHighestResults = results
+			throughputHighestPut = totalPut
+
+			if doBreak {
+				sendResult()
+				break
+			}
+
+			if !autotune {
+				sendResult()
+				break
+			}
+			sendResult()
+			// Try with a higher concurrency to see if we get better throughput
+			concurrency += (concurrency + 1) / 2
+		}
+	}()
+	return ch
 }

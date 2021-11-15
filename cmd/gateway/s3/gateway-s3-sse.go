@@ -113,7 +113,7 @@ func (l *s3EncObjects) ListObjectsV2(ctx context.Context, bucket, prefix, contin
 			} else {
 				objects = append(objects, obj)
 			}
-			if len(objects) > maxKeys {
+			if maxKeys > 0 && len(objects) > maxKeys {
 				break
 			}
 		}
@@ -130,7 +130,7 @@ func (l *s3EncObjects) ListObjectsV2(ctx context.Context, bucket, prefix, contin
 				prefixes = append(prefixes, p)
 			}
 		}
-		if (len(objects) > maxKeys) || !loi.IsTruncated {
+		if (maxKeys > 0 && len(objects) > maxKeys) || !loi.IsTruncated {
 			break
 		}
 	}
@@ -345,7 +345,7 @@ func (l *s3EncObjects) GetObjectNInfo(ctx context.Context, bucket, object string
 	// Setup cleanup function to cause the above go-routine to
 	// exit in case of partial read
 	pipeCloser := func() { pr.Close() }
-	return fn(pr, h, o.CheckPrecondFn, pipeCloser)
+	return fn(pr, h, pipeCloser)
 }
 
 // GetObjectInfo reads object info and replies back ObjectInfo
@@ -784,7 +784,7 @@ func (l *s3EncObjects) getStalePartsForBucket(ctx context.Context, bucket string
 	return
 }
 
-func (l *s3EncObjects) DeleteBucket(ctx context.Context, bucket string, forceDelete bool) error {
+func (l *s3EncObjects) DeleteBucket(ctx context.Context, bucket string, opts minio.DeleteBucketOptions) error {
 	var prefix, continuationToken, delimiter, startAfter string
 	expParts := make(map[string]string)
 

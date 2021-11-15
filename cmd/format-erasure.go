@@ -242,7 +242,7 @@ func formatErasureMigrateV1ToV2(export, version string) error {
 	if err != nil {
 		return err
 	}
-	return ioutil.WriteFile(formatPath, b, 0644)
+	return ioutil.WriteFile(formatPath, b, 0666)
 }
 
 // Migrates V2 for format.json to V3 (Flat hierarchy for multipart)
@@ -284,7 +284,7 @@ func formatErasureMigrateV2ToV3(export, version string) error {
 	if err != nil {
 		return err
 	}
-	return ioutil.WriteFile(formatPath, b, 0644)
+	return ioutil.WriteFile(formatPath, b, 0666)
 }
 
 // countErrs - count a specific error.
@@ -695,20 +695,6 @@ func initErasureMetaVolumesInLocalDisks(storageDisks []StorageAPI, formats []*fo
 	}
 
 	// Return success here.
-	return nil
-}
-
-// saveUnformattedFormat - populates `format.json` on unformatted disks.
-// also adds `.healing.bin` on the disks which are being actively healed.
-func saveUnformattedFormat(ctx context.Context, storageDisks []StorageAPI, formats []*formatErasureV3) error {
-	for index, format := range formats {
-		if format == nil {
-			continue
-		}
-		if err := saveFormatErasure(storageDisks[index], format, true); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 

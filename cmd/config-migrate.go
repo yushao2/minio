@@ -41,7 +41,8 @@ import (
 	"github.com/minio/minio/internal/event/target"
 	"github.com/minio/minio/internal/kms"
 	"github.com/minio/minio/internal/logger"
-	xnet "github.com/minio/minio/internal/net"
+	"github.com/minio/minio/internal/logger/target/http"
+	xnet "github.com/minio/pkg/net"
 	"github.com/minio/pkg/quick"
 )
 
@@ -2383,8 +2384,8 @@ func migrateV26ToV27() error {
 	// Enable console logging by default to avoid breaking users
 	// current deployments
 	srvConfig.Logger.Console.Enabled = true
-	srvConfig.Logger.HTTP = make(map[string]logger.HTTP)
-	srvConfig.Logger.HTTP["1"] = logger.HTTP{}
+	srvConfig.Logger.HTTP = make(map[string]http.Config)
+	srvConfig.Logger.HTTP["1"] = http.Config{}
 
 	if err = quick.SaveConfig(srvConfig, configFile, globalEtcdClient); err != nil {
 		return fmt.Errorf("Failed to migrate config from ‘26’ to ‘27’. %w", err)
@@ -2748,12 +2749,11 @@ func migrateMinioSysConfigToKV(objAPI ObjectLayer) error {
 	for k, loggerArgs := range cfg.Logger.HTTP {
 		logger.SetLoggerHTTP(newCfg, k, loggerArgs)
 	}
-	for k, auditArgs := range cfg.Logger.Audit {
+	for k, auditArgs := range cfg.Logger.AuditWebhook {
 		logger.SetLoggerHTTPAudit(newCfg, k, auditArgs)
 	}
 
 	xldap.SetIdentityLDAP(newCfg, cfg.LDAPServerConfig)
-	openid.SetIdentityOpenID(newCfg, cfg.OpenID)
 	opa.SetPolicyOPAConfig(newCfg, cfg.Policy.OPA)
 	cache.SetCacheConfig(newCfg, cfg.Cache)
 	compress.SetCompressionConfig(newCfg, cfg.Compression)

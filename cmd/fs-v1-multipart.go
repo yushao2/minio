@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	pathutil "path"
 	"sort"
 	"strconv"
 	"strings"
@@ -241,7 +240,7 @@ func (fs *FSObjects) NewMultipartUpload(ctx context.Context, bucket, object stri
 		return "", err
 	}
 
-	if err = ioutil.WriteFile(pathJoin(uploadIDDir, fs.metaJSONFile), fsMetaBytes, 0644); err != nil {
+	if err = ioutil.WriteFile(pathJoin(uploadIDDir, fs.metaJSONFile), fsMetaBytes, 0666); err != nil {
 		logger.LogIf(ctx, err)
 		return "", err
 	}
@@ -550,11 +549,6 @@ func (fs *FSObjects) CompleteMultipartUpload(ctx context.Context, bucket string,
 		return oi, toObjectErr(err)
 	}
 
-	// Check if an object is present as one of the parent dir.
-	if fs.parentDirIsObject(ctx, bucket, pathutil.Dir(object)) {
-		return oi, toObjectErr(errFileParentIsFile, bucket, object)
-	}
-
 	if _, err := fs.statBucketDir(ctx, bucket); err != nil {
 		return oi, toObjectErr(err, bucket)
 	}
@@ -569,9 +563,6 @@ func (fs *FSObjects) CompleteMultipartUpload(ctx context.Context, bucket string,
 		}
 		return oi, toObjectErr(err, bucket, object)
 	}
-
-	// Calculate s3 compatible md5sum for complete multipart.
-	s3MD5 := getCompleteMultipartMD5(parts)
 
 	// ensure that part ETag is canonicalized to strip off extraneous quotes
 	for i := range parts {
@@ -761,7 +752,12 @@ func (fs *FSObjects) CompleteMultipartUpload(ctx context.Context, bucket string,
 	if fsMeta.Meta == nil {
 		fsMeta.Meta = make(map[string]string)
 	}
-	fsMeta.Meta["etag"] = s3MD5
+
+	fsMeta.Meta["etag"] = opts.UserDefined["etag"]
+	if fsMeta.Meta["etag"] == "" {
+		fsMeta.Meta["etag"] = getCompleteMultipartMD5(parts)
+	}
+
 	// Save consolidated actual size.
 	fsMeta.Meta[ReservedMetadataPrefix+"actual-size"] = strconv.FormatInt(objectActualSize, 10)
 	if _, err = fsMeta.WriteTo(metaFile); err != nil {
@@ -851,8 +847,8 @@ func (fs *FSObjects) AbortMultipartUpload(ctx context.Context, bucket, object, u
 // Removes multipart uploads if any older than `expiry` duration
 // on all buckets for every `cleanupInterval`, this function is
 // blocking and should be run in a go-routine.
-func (fs *FSObjects) cleanupStaleUploads(ctx context.Context, cleanupInterval, expiry time.Duration) {
-	timer := time.NewTimer(cleanupInterval)
+func (fs *FSObjects) cleanupStaleUploads(ctx context.Context) {
+	timer := time.NewTimer(globalAPIConfig.getStaleUploadsCleanupInterval())
 	defer timer.Stop()
 
 	for {
@@ -861,7 +857,9 @@ func (fs *FSObjects) cleanupStaleUploads(ctx context.Context, cleanupInterval, e
 			return
 		case <-timer.C:
 			// Reset for the next interval
-			timer.Reset(cleanupInterval)
+			timer.Reset(globalAPIConfig.getStaleUploadsCleanupInterval())
+
+			expiry := globalAPIConfig.getStaleUploadsExpiry()
 
 			now := time.Now()
 			entries, err := readDir(pathJoin(fs.fsPath, minioMetaMultipartBucket))

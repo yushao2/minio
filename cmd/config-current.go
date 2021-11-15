@@ -34,15 +34,18 @@ import (
 	"github.com/minio/minio/internal/config/heal"
 	xldap "github.com/minio/minio/internal/config/identity/ldap"
 	"github.com/minio/minio/internal/config/identity/openid"
+	xtls "github.com/minio/minio/internal/config/identity/tls"
 	"github.com/minio/minio/internal/config/notify"
 	"github.com/minio/minio/internal/config/policy/opa"
 	"github.com/minio/minio/internal/config/scanner"
 	"github.com/minio/minio/internal/config/storageclass"
+	"github.com/minio/minio/internal/config/subnet"
 	"github.com/minio/minio/internal/crypto"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/kms"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/logger/target/http"
+	"github.com/minio/minio/internal/logger/target/kafka"
 	"github.com/minio/pkg/env"
 )
 
@@ -53,14 +56,17 @@ func initHelp() {
 		config.CompressionSubSys:    compress.DefaultKVS,
 		config.IdentityLDAPSubSys:   xldap.DefaultKVS,
 		config.IdentityOpenIDSubSys: openid.DefaultKVS,
+		config.IdentityTLSSubSys:    xtls.DefaultKVS,
 		config.PolicyOPASubSys:      opa.DefaultKVS,
 		config.RegionSubSys:         config.DefaultRegionKVS,
 		config.APISubSys:            api.DefaultKVS,
 		config.CredentialsSubSys:    config.DefaultCredentialKVS,
 		config.LoggerWebhookSubSys:  logger.DefaultKVS,
-		config.AuditWebhookSubSys:   logger.DefaultAuditKVS,
+		config.AuditWebhookSubSys:   logger.DefaultAuditWebhookKVS,
+		config.AuditKafkaSubSys:     logger.DefaultAuditKafkaKVS,
 		config.HealSubSys:           heal.DefaultKVS,
 		config.ScannerSubSys:        scanner.DefaultKVS,
+		config.SubnetSubSys:         subnet.DefaultKVS,
 	}
 	for k, v := range notify.DefaultNotificationKVS {
 		kvs[k] = v
@@ -97,12 +103,12 @@ func initHelp() {
 			Description: "enable LDAP SSO support",
 		},
 		config.HelpKV{
-			Key:         config.PolicyOPASubSys,
-			Description: "[DEPRECATED] enable external OPA for policy enforcement",
+			Key:         config.IdentityTLSSubSys,
+			Description: "enable X.509 TLS certificate SSO support",
 		},
 		config.HelpKV{
-			Key:         config.KmsKesSubSys,
-			Description: "enable external MinIO key encryption service",
+			Key:         config.PolicyOPASubSys,
+			Description: "[DEPRECATED] enable external OPA for policy enforcement",
 		},
 		config.HelpKV{
 			Key:         config.APISubSys,
@@ -124,6 +130,11 @@ func initHelp() {
 		config.HelpKV{
 			Key:             config.AuditWebhookSubSys,
 			Description:     "send audit logs to webhook endpoints",
+			MultipleTargets: true,
+		},
+		config.HelpKV{
+			Key:             config.AuditKafkaSubSys,
+			Description:     "send audit logs to kafka endpoints",
 			MultipleTargets: true,
 		},
 		config.HelpKV{
@@ -176,6 +187,12 @@ func initHelp() {
 			Description:     "publish bucket notifications to Redis datastores",
 			MultipleTargets: true,
 		},
+		config.HelpKV{
+			Key:         config.SubnetSubSys,
+			Type:        "string",
+			Description: "set subnet config for the cluster e.g. license token",
+			Optional:    true,
+		},
 	}
 
 	if globalIsErasure {
@@ -199,9 +216,11 @@ func initHelp() {
 		config.ScannerSubSys:        scanner.Help,
 		config.IdentityOpenIDSubSys: openid.Help,
 		config.IdentityLDAPSubSys:   xldap.Help,
+		config.IdentityTLSSubSys:    xtls.Help,
 		config.PolicyOPASubSys:      opa.Help,
 		config.LoggerWebhookSubSys:  logger.Help,
-		config.AuditWebhookSubSys:   logger.HelpAudit,
+		config.AuditWebhookSubSys:   logger.HelpWebhook,
+		config.AuditKafkaSubSys:     logger.HelpKafka,
 		config.NotifyAMQPSubSys:     notify.HelpAMQP,
 		config.NotifyKafkaSubSys:    notify.HelpKafka,
 		config.NotifyMQTTSubSys:     notify.HelpMQTT,
@@ -212,6 +231,7 @@ func initHelp() {
 		config.NotifyRedisSubSys:    notify.HelpRedis,
 		config.NotifyWebhookSubSys:  notify.HelpWebhook,
 		config.NotifyESSubSys:       notify.HelpES,
+		config.SubnetSubSys:         subnet.HelpLicense,
 	}
 
 	config.RegisterHelpSubSys(helpMap)
@@ -223,7 +243,9 @@ var (
 	globalServerConfigMu sync.RWMutex
 )
 
-func validateConfig(s config.Config, setDriveCounts []int) error {
+func validateConfig(s config.Config) error {
+	objAPI := newObjectLayerFn()
+
 	// We must have a global lock for this so nobody else modifies env while we do.
 	defer env.LockSetEnv()()
 
@@ -246,7 +268,10 @@ func validateConfig(s config.Config, setDriveCounts []int) error {
 	}
 
 	if globalIsErasure {
-		for _, setDriveCount := range setDriveCounts {
+		if objAPI == nil {
+			return errServerNotInitialized
+		}
+		for _, setDriveCount := range objAPI.SetDriveCounts() {
 			if _, err := storageclass.LookupConfig(s[config.StorageClassSubSys][config.Default], setDriveCount); err != nil {
 				return err
 			}
@@ -261,7 +286,7 @@ func validateConfig(s config.Config, setDriveCounts []int) error {
 	if err != nil {
 		return err
 	}
-	objAPI := newObjectLayerFn()
+
 	if objAPI != nil {
 		if compCfg.Enabled && !objAPI.IsCompressionSupported() {
 			return fmt.Errorf("Backend does not support compression")
@@ -308,6 +333,12 @@ func validateConfig(s config.Config, setDriveCounts []int) error {
 			conn.Close()
 		}
 	}
+	{
+		_, err := xtls.Lookup(s[config.IdentityTLSSubSys][config.Default])
+		if err != nil {
+			return err
+		}
+	}
 
 	if _, err := opa.LookupConfig(s[config.PolicyOPASubSys][config.Default],
 		NewGatewayHTTPTransport(), xhttp.DrainBody); err != nil {
@@ -321,7 +352,7 @@ func validateConfig(s config.Config, setDriveCounts []int) error {
 	return notify.TestNotificationTargets(GlobalContext, s, NewGatewayHTTPTransport(), globalNotificationSys.ConfiguredTargetIDs())
 }
 
-func lookupConfigs(s config.Config, setDriveCounts []int) {
+func lookupConfigs(s config.Config, objAPI ObjectLayer) {
 	ctx := GlobalContext
 
 	var err error
@@ -333,7 +364,15 @@ func lookupConfigs(s config.Config, setDriveCounts []int) {
 		}
 	}
 
-	if dnsURL, dnsUser, dnsPass, ok := env.LookupEnv(config.EnvDNSWebhook); ok {
+	dnsURL, dnsUser, dnsPass, err := env.LookupEnv(config.EnvDNSWebhook)
+	if err != nil {
+		if globalIsGateway {
+			logger.FatalIf(err, "Unable to initialize remote webhook DNS config")
+		} else {
+			logger.LogIf(ctx, fmt.Errorf("Unable to initialize remote webhook DNS config %w", err))
+		}
+	}
+	if err == nil && dnsURL != "" {
 		globalDNSConfig, err = dns.NewOperatorDNS(dnsURL,
 			dns.Authentication(dnsUser, dnsPass),
 			dns.RootCAs(globalRootCAs))
@@ -408,14 +447,13 @@ func lookupConfigs(s config.Config, setDriveCounts []int) {
 		logger.LogIf(ctx, fmt.Errorf("Invalid api configuration: %w", err))
 	}
 
-	globalAPIConfig.init(apiConfig, setDriveCounts)
-
 	// Initialize remote instance transport once.
 	getRemoteInstanceTransportOnce.Do(func() {
 		getRemoteInstanceTransport = newGatewayHTTPTransport(apiConfig.RemoteTransportDeadline)
 	})
 
-	if globalIsErasure {
+	if globalIsErasure && objAPI != nil {
+		setDriveCounts := objAPI.SetDriveCounts()
 		for i, setDriveCount := range setDriveCounts {
 			sc, err := storageclass.LookupConfig(s[config.StorageClassSubSys][config.Default], setDriveCount)
 			if err != nil {
@@ -453,6 +491,15 @@ func lookupConfigs(s config.Config, setDriveCounts []int) {
 		logger.Fatal(errors.New("no KMS configured"), "MINIO_KMS_AUTO_ENCRYPTION requires a valid KMS configuration")
 	}
 
+	globalSTSTLSConfig, err = xtls.Lookup(s[config.IdentityTLSSubSys][config.Default])
+	if err != nil {
+		logger.LogIf(ctx, fmt.Errorf("Unable to initialize X.509/TLS STS API: %w", err))
+	}
+
+	if globalSTSTLSConfig.InsecureSkipVerify {
+		logger.Info("CRITICAL: enabling %s is not recommended in a production environment", xtls.EnvIdentityTLSSkipVerify)
+	}
+
 	globalOpenIDConfig, err = openid.LookupConfig(s[config.IdentityOpenIDSubSys][config.Default],
 		NewGatewayHTTPTransport(), xhttp.DrainBody)
 	if err != nil {
@@ -474,6 +521,11 @@ func lookupConfigs(s config.Config, setDriveCounts []int) {
 		logger.LogIf(ctx, fmt.Errorf("Unable to parse LDAP configuration: %w", err))
 	}
 
+	globalSubnetConfig, err = subnet.LookupConfig(s[config.SubnetSubSys][config.Default])
+	if err != nil {
+		logger.LogIf(ctx, fmt.Errorf("Unable to parse subnet configuration: %w", err))
+	}
+
 	// Load logger targets based on user's configuration
 	loggerUserAgent := getUserAgent(getMinioMode())
 
@@ -482,38 +534,36 @@ func lookupConfigs(s config.Config, setDriveCounts []int) {
 		logger.LogIf(ctx, fmt.Errorf("Unable to initialize logger: %w", err))
 	}
 
-	for k, l := range loggerCfg.HTTP {
+	for _, l := range loggerCfg.HTTP {
 		if l.Enabled {
+			l.LogOnce = logger.LogOnceIf
+			l.UserAgent = loggerUserAgent
+			l.Transport = NewGatewayHTTPTransportWithClientCerts(l.ClientCert, l.ClientKey)
 			// Enable http logging
-			if err = logger.AddTarget(
-				http.New(
-					http.WithTargetName(k),
-					http.WithEndpoint(l.Endpoint),
-					http.WithAuthToken(l.AuthToken),
-					http.WithUserAgent(loggerUserAgent),
-					http.WithLogKind(string(logger.All)),
-					http.WithTransport(NewGatewayHTTPTransport()),
-				),
-			); err != nil {
+			if err = logger.AddTarget(http.New(l)); err != nil {
 				logger.LogIf(ctx, fmt.Errorf("Unable to initialize console HTTP target: %w", err))
 			}
 		}
 	}
 
-	for k, l := range loggerCfg.Audit {
+	for _, l := range loggerCfg.AuditWebhook {
 		if l.Enabled {
+			l.LogOnce = logger.LogOnceIf
+			l.UserAgent = loggerUserAgent
+			l.Transport = NewGatewayHTTPTransportWithClientCerts(l.ClientCert, l.ClientKey)
 			// Enable http audit logging
-			if err = logger.AddAuditTarget(
-				http.New(
-					http.WithTargetName(k),
-					http.WithEndpoint(l.Endpoint),
-					http.WithAuthToken(l.AuthToken),
-					http.WithUserAgent(loggerUserAgent),
-					http.WithLogKind(string(logger.All)),
-					http.WithTransport(NewGatewayHTTPTransportWithClientCerts(l.ClientCert, l.ClientKey)),
-				),
-			); err != nil {
+			if err = logger.AddAuditTarget(http.New(l)); err != nil {
 				logger.LogIf(ctx, fmt.Errorf("Unable to initialize audit HTTP target: %w", err))
+			}
+		}
+	}
+
+	for _, l := range loggerCfg.AuditKafka {
+		if l.Enabled {
+			l.LogOnce = logger.LogOnceIf
+			// Enable Kafka audit logging
+			if err = logger.AddAuditTarget(kafka.New(l)); err != nil {
+				logger.LogIf(ctx, fmt.Errorf("Unable to initialize audit Kafka target: %w", err))
 			}
 		}
 	}
@@ -529,16 +579,18 @@ func lookupConfigs(s config.Config, setDriveCounts []int) {
 	}
 
 	// Apply dynamic config values
-	logger.LogIf(ctx, applyDynamicConfig(ctx, newObjectLayerFn(), s))
+	if err := applyDynamicConfig(ctx, objAPI, s); err != nil {
+		if globalIsGateway {
+			logger.FatalIf(err, "Unable to initialize dynamic configuration")
+		} else {
+			logger.LogIf(ctx, err)
+		}
+	}
 }
 
 // applyDynamicConfig will apply dynamic config values.
 // Dynamic systems should be in config.SubSystemsDynamic as well.
 func applyDynamicConfig(ctx context.Context, objAPI ObjectLayer, s config.Config) error {
-	if objAPI == nil {
-		return nil
-	}
-
 	// Read all dynamic configs.
 	// API
 	apiConfig, err := api.LookupConfig(s[config.APISubSys][config.Default])
@@ -553,8 +605,10 @@ func applyDynamicConfig(ctx context.Context, objAPI ObjectLayer, s config.Config
 	}
 
 	// Validate if the object layer supports compression.
-	if cmpCfg.Enabled && !objAPI.IsCompressionSupported() {
-		return fmt.Errorf("Backend does not support compression")
+	if objAPI != nil {
+		if cmpCfg.Enabled && !objAPI.IsCompressionSupported() {
+			return fmt.Errorf("Backend does not support compression")
+		}
 	}
 
 	// Heal
@@ -571,15 +625,17 @@ func applyDynamicConfig(ctx context.Context, objAPI ObjectLayer, s config.Config
 
 	// Apply configurations.
 	// We should not fail after this.
-	globalAPIConfig.init(apiConfig, objAPI.SetDriveCounts())
+	var setDriveCounts []int
+	if objAPI != nil {
+		setDriveCounts = objAPI.SetDriveCounts()
+	}
+	globalAPIConfig.init(apiConfig, setDriveCounts)
 
 	globalCompressConfigMu.Lock()
 	globalCompressConfig = cmpCfg
 	globalCompressConfigMu.Unlock()
 
-	globalHealConfigMu.Lock()
-	globalHealConfig = healCfg
-	globalHealConfigMu.Unlock()
+	globalHealConfig.Update(healCfg)
 
 	// update dynamic scanner values.
 	scannerCycle.Update(scannerCfg.Cycle)
@@ -704,7 +760,7 @@ func loadConfig(objAPI ObjectLayer) error {
 	}
 
 	// Override any values from ENVs.
-	lookupConfigs(srvCfg, objAPI.SetDriveCounts())
+	lookupConfigs(srvCfg, objAPI)
 
 	// hold the mutex lock before a new config is assigned.
 	globalServerConfigMu.Lock()
@@ -721,8 +777,8 @@ func loadConfig(objAPI ObjectLayer) error {
 func getOpenIDValidators(cfg openid.Config) *openid.Validators {
 	validators := openid.NewValidators()
 
-	if cfg.JWKS.URL != nil {
-		validators.Add(openid.NewJWT(cfg))
+	if cfg.Enabled {
+		validators.Add(&cfg)
 	}
 
 	return validators

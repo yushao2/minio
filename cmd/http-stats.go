@@ -38,12 +38,12 @@ type ConnStats struct {
 }
 
 // Increase total input bytes
-func (s *ConnStats) incInputBytes(n int) {
+func (s *ConnStats) incInputBytes(n int64) {
 	atomic.AddUint64(&s.totalInputBytes, uint64(n))
 }
 
 // Increase total output bytes
-func (s *ConnStats) incOutputBytes(n int) {
+func (s *ConnStats) incOutputBytes(n int64) {
 	atomic.AddUint64(&s.totalOutputBytes, uint64(n))
 }
 
@@ -58,12 +58,12 @@ func (s *ConnStats) getTotalOutputBytes() uint64 {
 }
 
 // Increase outbound input bytes
-func (s *ConnStats) incS3InputBytes(n int) {
+func (s *ConnStats) incS3InputBytes(n int64) {
 	atomic.AddUint64(&s.s3InputBytes, uint64(n))
 }
 
 // Increase outbound output bytes
-func (s *ConnStats) incS3OutputBytes(n int) {
+func (s *ConnStats) incS3OutputBytes(n int64) {
 	atomic.AddUint64(&s.s3OutputBytes, uint64(n))
 }
 
@@ -138,15 +138,15 @@ func (stats *HTTPAPIStats) Load() map[string]int {
 // HTTPStats holds statistics information about
 // HTTP requests made by all clients
 type HTTPStats struct {
+	rejectedRequestsAuth    uint64
+	rejectedRequestsTime    uint64
+	rejectedRequestsHeader  uint64
+	rejectedRequestsInvalid uint64
 	s3RequestsInQueue       int32
 	currentS3Requests       HTTPAPIStats
 	totalS3Requests         HTTPAPIStats
 	totalS3Errors           HTTPAPIStats
 	totalS3Canceled         HTTPAPIStats
-	rejectedRequestsAuth    uint64
-	rejectedRequestsTime    uint64
-	rejectedRequestsHeader  uint64
-	rejectedRequestsInvalid uint64
 }
 
 func (st *HTTPStats) addRequestsInQueue(i int32) {
@@ -178,8 +178,8 @@ func (st *HTTPStats) toServerHTTPStats() ServerHTTPStats {
 
 // Update statistics from http request and response data
 func (st *HTTPStats) updateStats(api string, r *http.Request, w *logger.ResponseWriter) {
-	// A successful request has a 2xx response code
-	successReq := w.StatusCode >= 200 && w.StatusCode < 300
+	// A successful request has a 2xx response code or < 4xx response
+	successReq := w.StatusCode >= 200 && w.StatusCode < 400
 
 	if !strings.HasSuffix(r.URL.Path, prometheusMetricsPathLegacy) ||
 		!strings.HasSuffix(r.URL.Path, prometheusMetricsV2ClusterPath) ||
@@ -189,7 +189,7 @@ func (st *HTTPStats) updateStats(api string, r *http.Request, w *logger.Response
 			switch w.StatusCode {
 			case 0:
 			case 499:
-				// 499 is a good error, shall be counted at canceled.
+				// 499 is a good error, shall be counted as canceled.
 				st.totalS3Canceled.Inc(api)
 			default:
 				st.totalS3Errors.Inc(api)

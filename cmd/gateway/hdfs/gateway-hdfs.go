@@ -28,6 +28,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -41,10 +42,9 @@ import (
 	"github.com/minio/madmin-go"
 	"github.com/minio/minio-go/v7/pkg/s3utils"
 	minio "github.com/minio/minio/cmd"
-	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/logger"
-	xnet "github.com/minio/minio/internal/net"
 	"github.com/minio/pkg/env"
+	xnet "github.com/minio/pkg/net"
 )
 
 const (
@@ -158,7 +158,7 @@ func getKerberosClient() (*krb.Client, error) {
 }
 
 // NewGatewayLayer returns hdfs gatewaylayer.
-func (g *HDFS) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error) {
+func (g *HDFS) NewGatewayLayer(creds madmin.Credentials) (minio.ObjectLayer, error) {
 	dialFunc := (&net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
@@ -221,11 +221,6 @@ func (g *HDFS) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error
 	}
 
 	return &hdfsObjects{clnt: clnt, subPath: commonPath, listPool: minio.NewTreeWalkPool(time.Minute * 30)}, nil
-}
-
-// Production - hdfs gateway is production ready.
-func (g *HDFS) Production() bool {
-	return true
 }
 
 func (n *hdfsObjects) Shutdown(ctx context.Context) error {
@@ -311,11 +306,11 @@ func (n *hdfsObjects) hdfsPathJoin(args ...string) string {
 	return minio.PathJoin(append([]string{n.subPath, hdfsSeparator}, args...)...)
 }
 
-func (n *hdfsObjects) DeleteBucket(ctx context.Context, bucket string, forceDelete bool) error {
+func (n *hdfsObjects) DeleteBucket(ctx context.Context, bucket string, opts minio.DeleteBucketOptions) error {
 	if !hdfsIsValidBucketName(bucket) {
 		return minio.BucketNameInvalid{Bucket: bucket}
 	}
-	if forceDelete {
+	if opts.Force {
 		return hdfsToObjectErr(ctx, n.clnt.RemoveAll(n.hdfsPathJoin(bucket)), bucket)
 	}
 	return hdfsToObjectErr(ctx, n.clnt.Remove(n.hdfsPathJoin(bucket)), bucket)
@@ -413,6 +408,7 @@ func (n *hdfsObjects) listDirFactory() minio.ListDirFunc {
 
 // ListObjects lists all blobs in HDFS bucket filtered by prefix.
 func (n *hdfsObjects) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (loi minio.ListObjectsInfo, err error) {
+	var mutex sync.Mutex
 	fileInfos := make(map[string]os.FileInfo)
 	targetPath := n.hdfsPathJoin(bucket, prefix)
 
@@ -436,6 +432,9 @@ func (n *hdfsObjects) ListObjects(ctx context.Context, bucket, prefix, marker, d
 	}
 
 	getObjectInfo := func(ctx context.Context, bucket, entry string) (minio.ObjectInfo, error) {
+		mutex.Lock()
+		defer mutex.Unlock()
+
 		filePath := path.Clean(n.hdfsPathJoin(bucket, entry))
 		fi, ok := fileInfos[filePath]
 
